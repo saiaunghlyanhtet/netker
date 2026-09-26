@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Lint
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Install crun and nftables
+        run: sudo apt-get update && sudo apt-get install -y crun nftables
+
+      - name: netker system check
+        run: make build && sudo bin/netker system check
+
+      # Ubuntu restricts unprivileged user namespaces, so the tests that
+      # create netkit devices run as root, in their own network namespace
+      # (away from Docker's iptables rules on the runner).
+      - name: Integration tests (real netkit devices)
+        run: |
+          go test -c -o /tmp/network.test ./internal/network/
+          sudo unshare --net --mount /tmp/network.test -test.count=1 -test.v
+
+      - name: End-to-end
+        run: |
+          export NETKER_ROOT=/tmp/netker/root NETKER_RUN=/tmp/netker/run
+          sudo -E bin/netker pull alpine
+          sudo -E PATH="$PWD/bin:$PATH" unshare --net --mount hack/e2e.sh
