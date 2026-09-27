@@ -41,6 +41,22 @@ func Runtime() string {
 	return "crun"
 }
 
+// BPFFS is where the eBPF datapath pins its maps and links.
+func BPFFS() string {
+	if v := os.Getenv("NETKER_BPFFS"); v != "" {
+		return v
+	}
+	return "/sys/fs/bpf/netker"
+}
+
+// DatapathMode is "ebpf", "legacy" or "auto" (ebpf when BPF can be loaded).
+func DatapathMode() string {
+	if v := os.Getenv("NETKER_DATAPATH"); v != "" {
+		return v
+	}
+	return "auto"
+}
+
 // CgroupManager is passed to the OCI runtime as --cgroup-manager when set
 // (e.g. "disabled" inside the unprivileged sandbox).
 func CgroupManager() string {

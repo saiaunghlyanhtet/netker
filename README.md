@@ -4,13 +4,22 @@ Docker-compatible containers networked with Linux **netkit** devices
 (`drivers/net/netkit.c`) instead of veth pairs and a bridge.
 
 Each container gets a netkit pair. The primary device stays in the host,
-and the peer becomes the container's `eth0`. The design (docs/DESIGN.md) moves
-forwarding and NAT into BPF programs attached to those devices, following the
-approach Cilium uses for pods.
+and the peer becomes the container's `eth0`. BPF programs attached to the
+pair (the approach Cilium uses for pods) decide what the container may send
+and forward traffic between containers without the host stack.
 
-> Status: early. Milestones M0 and M1 from [docs/DESIGN.md](docs/DESIGN.md) work: container
-> lifecycle plus netkit networking with the host stack and nftables doing
-> forwarding and NAT ("netkit-legacy" datapath). The eBPF datapath (M2+) is next.
+> Status: early. Milestones M0–M2 from [docs/DESIGN.md](docs/DESIGN.md) work:
+> - container lifecycle (crun, overlayfs, OCI images)
+> - one netkit pair per container, L3 (default) or L2 mode
+> - eBPF datapath when run as root: container-to-container redirect in BPF,
+>   isolation between networks, source-IP anti-spoofing, fail-closed devices,
+>   pinned links that survive the CLI, in-place program upgrades
+> - traffic to the host and the internet still goes through the host stack,
+>   with nftables for NAT and `-p` (BPF NAT is M3)
+>
+> Without the privileges to load BPF, netker falls back to the "legacy"
+> datapath (same devices, host stack forwarding). Force either one with
+> `NETKER_DATAPATH=ebpf|legacy`.
 
 ## Requirements
 
@@ -37,7 +46,13 @@ sudo bin/netker rm -f web
 ```
 
 Commands: `run create start stop restart kill rm ps exec logs inspect port`,
-`pull images rmi`, `network create|ls|rm|inspect`, `system check`, `version`.
+`pull images rmi`, `network create|ls|rm|inspect`, `system check|gc`,
+`system datapath status|upgrade`, `version`.
+
+```sh
+sudo bin/netker system datapath status    # pinned links, endpoint map, counters per verdict
+sudo bin/netker system datapath upgrade   # swap every container's programs atomically
+```
 
 ## Try it without root
 
@@ -55,8 +70,11 @@ make e2e                 # the end-to-end test suite, unprivileged
 
 ```sh
 make test               # unit tests
-make test-integration   # real netkit devices in an unprivileged netns
-make e2e                # full CLI test in the sandbox
+make test-integration   # real netkit devices in an unprivileged netns (legacy datapath)
+make e2e                # full CLI test in the sandbox (legacy datapath)
+make test-ebpf          # network tests as root in a privileged Docker container (eBPF)
+make e2e-root           # full CLI test as root in a privileged Docker container (eBPF)
+go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
 ```
 
 ## Known gaps

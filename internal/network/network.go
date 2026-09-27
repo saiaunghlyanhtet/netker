@@ -17,6 +17,7 @@ import (
 	"sort"
 
 	"github.com/saiaunghlyanhtet/netker/internal/config"
+	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/idutil"
 	"github.com/saiaunghlyanhtet/netker/internal/ipam"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
@@ -47,9 +48,15 @@ type Network struct {
 
 type Store struct {
 	paths config.Paths
+	dp    *datapath.Datapath
 }
 
-func NewStore(p config.Paths) *Store { return &Store{paths: p} }
+func NewStore(p config.Paths) *Store {
+	return &Store{paths: p, dp: datapath.New(config.BPFFS())}
+}
+
+// Datapath gives access to the eBPF datapath (for status and upgrades).
+func (s *Store) Datapath() *datapath.Datapath { return s.dp }
 
 func (s *Store) file(name string) string { return filepath.Join(s.paths.Networks(), name+".json") }
 
