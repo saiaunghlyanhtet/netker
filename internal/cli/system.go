@@ -21,7 +21,7 @@ func systemCmd() *cobra.Command {
 		Use:   "system",
 		Short: "Manage netker and check the host",
 	}
-	cmd.AddCommand(checkCmd())
+	cmd.AddCommand(checkCmd(), datapathCmd(), gcCmd())
 	return cmd
 }
 
@@ -61,7 +61,14 @@ func checkCmd() *cobra.Command {
 			fsList, _ := os.ReadFile("/proc/filesystems")
 			checks = append(checks, check{name: "overlayfs", ok: bytes.Contains(fsList, []byte("\toverlay\n"))})
 			bpffs := unix.Statfs("/sys/fs/bpf", &sfs) == nil && sfs.Type == unix.BPF_FS_MAGIC
-			checks = append(checks, check{name: "bpffs at /sys/fs/bpf", ok: bpffs, warn: !bpffs, detail: "needed by the eBPF datapath (not used yet)"})
+			checks = append(checks, check{name: "bpffs at /sys/fs/bpf", ok: bpffs, warn: !bpffs, detail: "needed by the eBPF datapath"})
+			dp := manager().Networks.Datapath()
+			if err := dp.Load(); err != nil {
+				checks = append(checks, check{name: "eBPF datapath", warn: true, detail: "not loadable, containers use the legacy datapath: " + err.Error()})
+			} else {
+				checks = append(checks, check{name: "eBPF datapath", ok: true})
+			}
+			dp.Close()
 
 			for _, bin := range []string{config.Runtime(), "nft"} {
 				p, err := exec.LookPath(bin)

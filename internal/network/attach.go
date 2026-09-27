@@ -11,6 +11,8 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/saiaunghlyanhtet/netker/internal/config"
+	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
 	"github.com/saiaunghlyanhtet/netker/internal/netns"
 )
@@ -23,7 +25,15 @@ type Endpoint struct {
 	IP      netip.Addr  `json:"ip"`
 	Gateway netip.Addr  `json:"gateway"`
 	Mode    netkit.Mode `json:"netkit_mode"`
+	// Datapath is "ebpf" or "legacy", fixed when the endpoint is created.
+	Datapath    string `json:"datapath"`
+	HostIfIndex int    `json:"host_ifindex"`
 }
+
+const (
+	DatapathEBPF   = "ebpf"
+	DatapathLegacy = "legacy"
+)
 
 // HostIfName is the primary device name for attachment index idx of a
 // container: "nk" + 11 ID characters + index, at most 15 characters.
@@ -45,21 +55,29 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err != nil {
 		return nil, err
 	}
+	mode, err := s.datapathMode()
+	if err != nil {
+		return nil, err
+	}
 	ip, err := pool.Allocate(containerID, want)
 	if err != nil {
 		return nil, err
 	}
 	ep = &Endpoint{
-		Network: n.Name,
-		IfName:  fmt.Sprintf("eth%d", idx),
-		HostIf:  HostIfName(containerID, idx),
-		IP:      ip,
-		Gateway: n.Gateway,
-		Mode:    n.Mode,
+		Network:  n.Name,
+		IfName:   fmt.Sprintf("eth%d", idx),
+		HostIf:   HostIfName(containerID, idx),
+		IP:       ip,
+		Gateway:  n.Gateway,
+		Mode:     n.Mode,
+		Datapath: mode,
 	}
 	defer func() {
 		if err != nil {
 			_ = netkit.Delete(ep.HostIf)
+			if mode == DatapathEBPF {
+				_ = s.dp.Detach(containerID, ep.HostIf, ip)
+			}
 			_ = pool.Release(ip)
 		}
 	}()
@@ -71,9 +89,10 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 		NetNSPath:   nsPath,
 		Mode:        n.Mode,
 		MTU:         n.MTU,
-		// The legacy datapath has no BPF program to open the gate, so the
-		// peer must forward by default. The eBPF datapath sets this.
-		FailClosed: false,
+		// With the eBPF datapath the container's egress is dropped until
+		// nk_from_container is attached, and whenever it gets detached.
+		// The legacy datapath has no program, so it must forward.
+		FailClosed: mode == DatapathEBPF,
 	}
 	if n.Mode == netkit.ModeL2 {
 		// Explicit MACs stop systemd's MACAddressPolicy from rewriting them
@@ -87,13 +106,61 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err := setupHostSide(ep); err != nil {
 		return nil, err
 	}
-	if err := netns.Do(nsPath, func() error { return setupContainerSide(ep, idx == 0) }); err != nil {
+	var peer netlink.Link
+	err = netns.Do(nsPath, func() error {
+		if err := setupContainerSide(ep, idx == 0); err != nil {
+			return err
+		}
+		peer, err = netlink.LinkByName(ep.IfName)
+		return err
+	})
+	if err != nil {
 		return nil, err
+	}
+	host, err := netlink.LinkByName(ep.HostIf)
+	if err != nil {
+		return nil, err
+	}
+	ep.HostIfIndex = host.Attrs().Index
+	if mode == DatapathEBPF {
+		err = s.dp.Attach(containerID, datapath.Endpoint{
+			IP:          ip,
+			HostIf:      ep.HostIf,
+			HostIfIndex: ep.HostIfIndex,
+			PeerIfIndex: peer.Attrs().Index,
+			NetID:       datapath.NetID(n.Name),
+			HostMAC:     host.Attrs().HardwareAddr,
+			PeerMAC:     peer.Attrs().HardwareAddr,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := ensureNetworkRules(n); err != nil {
 		return nil, err
 	}
 	return ep, nil
+}
+
+// datapathMode resolves NETKER_DATAPATH: "auto" picks eBPF when the programs
+// load (root with bpffs) and legacy otherwise.
+func (s *Store) datapathMode() (string, error) {
+	switch m := config.DatapathMode(); m {
+	case DatapathLegacy:
+		return DatapathLegacy, nil
+	case DatapathEBPF:
+		if err := s.dp.Load(); err != nil {
+			return "", err
+		}
+		return DatapathEBPF, nil
+	case "auto":
+		if s.dp.Load() == nil {
+			return DatapathEBPF, nil
+		}
+		return DatapathLegacy, nil
+	default:
+		return "", fmt.Errorf("unknown NETKER_DATAPATH %q (want ebpf, legacy or auto)", m)
+	}
 }
 
 // Detach removes the pair and frees the address. It tolerates a pair that
@@ -102,6 +169,12 @@ func (s *Store) Detach(ep *Endpoint, containerID string) error {
 	var errs []error
 	if err := netkit.Delete(ep.HostIf); err != nil {
 		errs = append(errs, err)
+	}
+	if ep.Datapath == DatapathEBPF {
+		if err := s.dp.Detach(containerID, ep.HostIf, ep.IP); err != nil {
+			errs = append(errs, err)
+		}
+		s.dp.ForgetMetrics(ep.HostIfIndex)
 	}
 	n, err := s.Get(ep.Network)
 	if err != nil {

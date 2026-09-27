@@ -30,6 +30,17 @@ expect "container side is eth0 in L3 mode" "NOARP" "$(netker exec e2e-web ip lin
 expect "host -> container" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
 expect "container -> container" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- "http://$ip/")"
 
+datapath=$(netker inspect e2e-web | sed -n 's/.*"datapath": "\(.*\)".*/\1/p' | head -1)
+echo "datapath: $datapath"
+if [[ "$datapath" == ebpf ]]; then
+	expect "eBPF: container egress is fail-closed" "peer policy blackhole" "$(ip -d link show "$host_if")"
+	status=$(netker system datapath status)
+	expect "eBPF: programs pinned on both sides" "primary" "$status"
+	expect "eBPF: container->container was redirected in BPF" "forward-local" "$status"
+	expect "eBPF: upgrade swaps programs in place" "updated 2 link(s)" "$(netker system datapath upgrade)"
+	expect "eBPF: traffic flows after upgrade" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
+fi
+
 ip link add e2e-pub0 type dummy
 ip addr add 192.0.2.10/24 dev e2e-pub0
 ip link set e2e-pub0 up
@@ -61,4 +72,9 @@ netker network rm e2e-l2 >/dev/null
 [[ -z "$(ip link show type netkit)" ]] || fail "netkit devices left behind: $(ip link show type netkit)"
 if nft list table ip netker 2>/dev/null | grep -q "netker:ctr:"; then fail "port rules left behind"; fi
 echo "ok: cleanup removed all netkit devices and port rules"
+if [[ "$datapath" == ebpf ]]; then
+	links=$(netker system datapath status --format json | tr -d ' \n' | grep -o '"links":\[[^]]*\]' || true)
+	[[ "$links" == '"links":null' || "$links" == '"links":[]' || -z "$links" ]] || fail "BPF links left behind: $links"
+	echo "ok: cleanup removed all BPF links"
+fi
 echo PASS
