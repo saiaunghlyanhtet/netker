@@ -8,15 +8,6 @@ and the peer becomes the container's `eth0`. BPF programs attached to the
 pair (the approach Cilium uses for pods) decide what the container may send
 and forward traffic between containers without the host stack.
 
-> Status: early. Milestones M0–M2 from [docs/DESIGN.md](docs/DESIGN.md) work:
-> - container lifecycle (crun, overlayfs, OCI images)
-> - one netkit pair per container, L3 (default) or L2 mode
-> - eBPF datapath when run as root: container-to-container redirect in BPF,
->   isolation between networks, source-IP anti-spoofing, fail-closed devices,
->   pinned links that survive the CLI, in-place program upgrades
-> - traffic to the host and the internet still goes through the host stack,
->   with nftables for NAT and `-p` (BPF NAT is M3)
->
 > Without the privileges to load BPF, netker falls back to the "legacy"
 > datapath (same devices, host stack forwarding). Force either one with
 > `NETKER_DATAPATH=ebpf|legacy`.
