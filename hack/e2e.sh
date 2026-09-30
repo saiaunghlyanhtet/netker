@@ -24,7 +24,11 @@ ip=$(netker inspect e2e-web | sed -n 's/.*"ip": "\(.*\)".*/\1/p' | head -1)
 [[ -n "$ip" ]] || fail "no IP in inspect output"
 
 host_if=$(netker inspect e2e-web | sed -n 's/.*"host_if": "\(.*\)".*/\1/p' | head -1)
-expect "host side is a netkit primary" "netkit mode l3 type primary" "$(ip -d link show "$host_if")"
+# Read the device through netker: iproute2 before netkit support (e.g. 6.1
+# in Ubuntu 24.04) only prints the link kind.
+devices=$(netker inspect e2e-web | tr -d ' \n' | grep -o '"netkit_devices":\[[^]]*\]')
+expect "host side is a netkit device" "netkit" "$(ip -d link show "$host_if")"
+expect "host side is the netkit primary in L3 mode" '"mode":"l3","primary":true' "$devices"
 expect "container side is eth0 in L3 mode" "NOARP" "$(netker exec e2e-web ip link show eth0)"
 
 expect "host -> container" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
@@ -33,7 +37,7 @@ expect "container -> container" "hello from" "$(timeout 10 netker run --rm alpin
 datapath=$(netker inspect e2e-web | sed -n 's/.*"datapath": "\(.*\)".*/\1/p' | head -1)
 echo "datapath: $datapath"
 if [[ "$datapath" == ebpf ]]; then
-	expect "eBPF: container egress is fail-closed" "peer policy blackhole" "$(ip -d link show "$host_if")"
+	expect "eBPF: container egress is fail-closed" '"peer_policy":"drop"' "$devices"
 	status=$(netker system datapath status)
 	expect "eBPF: programs pinned on both sides" "primary" "$status"
 	expect "eBPF: container->container was redirected in BPF" "forward-local" "$status"

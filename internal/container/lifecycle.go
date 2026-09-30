@@ -392,7 +392,10 @@ func (m *Manager) Exec(c *Container, tty bool, env []string, cwd string, args []
 	if m.Status(c) != "running" {
 		return -1, fmt.Errorf("container %s is not running", c.Name)
 	}
-	return m.rt.Exec(c.ID, tty, env, cwd, args, stdin, stdout, stderr)
+	// Always pass the whole environment: crun 1.14 (Ubuntu 24.04) replaces
+	// the process environment with --env values instead of adding them.
+	full := mergeEnv(oci.ProcessEnv(c.Env, c.Hostname, tty), env)
+	return m.rt.Exec(c.ID, tty, full, cwd, args, stdin, stdout, stderr)
 }
 
 // Remove deletes a container. A running container needs force.

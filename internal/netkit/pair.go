@@ -164,3 +164,58 @@ func Owned() (map[string]netlink.Link, error) {
 	}
 	return out, nil
 }
+
+// DeviceInfo is a netkit device's configuration as the kernel reports it.
+// Older iproute2 (before netkit support) only shows the link kind.
+type DeviceInfo struct {
+	Name       string `json:"name"`
+	Mode       Mode   `json:"mode"`
+	Primary    bool   `json:"primary"`
+	Policy     string `json:"policy"`      // pass or drop, when no program is attached
+	PeerPolicy string `json:"peer_policy"` // same, for the peer
+	Scrub      string `json:"scrub,omitempty"`
+	PeerScrub  string `json:"peer_scrub,omitempty"`
+}
+
+func policyName(p netlink.NetkitPolicy) string {
+	switch p {
+	case netlink.NETKIT_POLICY_FORWARD:
+		return "pass"
+	case netlink.NETKIT_POLICY_BLACKHOLE:
+		return "drop"
+	}
+	return fmt.Sprintf("unknown(%d)", p)
+}
+
+func scrubName(s netlink.NetkitScrub) string {
+	if s == netlink.NETKIT_SCRUB_NONE {
+		return "none"
+	}
+	return "default"
+}
+
+// Describe reads a netkit device's attributes over netlink.
+func Describe(name string) (*DeviceInfo, error) {
+	l, err := netlink.LinkByName(name)
+	if err != nil {
+		return nil, err
+	}
+	nk, ok := l.(*netlink.Netkit)
+	if !ok {
+		return nil, fmt.Errorf("%s is a %s device, not netkit", name, l.Type())
+	}
+	info := &DeviceInfo{
+		Name:       name,
+		Mode:       ModeL3,
+		Primary:    nk.IsPrimary(),
+		Policy:     policyName(nk.Policy),
+		PeerPolicy: policyName(nk.PeerPolicy),
+	}
+	if nk.Mode == netlink.NETKIT_MODE_L2 {
+		info.Mode = ModeL2
+	}
+	if nk.SupportsScrub() {
+		info.Scrub, info.PeerScrub = scrubName(nk.Scrub), scrubName(nk.PeerScrub)
+	}
+	return info, nil
+}

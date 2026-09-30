@@ -3,6 +3,7 @@ package oci
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -61,5 +62,27 @@ func TestSpecNetworkNamespace(t *testing.T) {
 	s, _ = Spec(SpecOptions{Args: []string{"sh"}, Rootfs: root})
 	if ns := netns(s); ns == nil || ns.Path != "" {
 		t.Fatal("expected a fresh netns")
+	}
+}
+
+func TestSpecVersionAcceptedByOldCrun(t *testing.T) {
+	s, err := Spec(SpecOptions{Args: []string{"sh"}, Rootfs: fakeRootfs(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s.Version, "1.0") {
+		t.Fatalf("ociVersion %q: older crun only accepts versions containing \"1.0\"", s.Version)
+	}
+}
+
+func TestProcessEnv(t *testing.T) {
+	env := ProcessEnv([]string{"FOO=1"}, "box", true)
+	for _, want := range []string{"PATH=", "FOO=1", "TERM=xterm", "HOSTNAME=box"} {
+		if !hasEnv(env, strings.SplitN(want, "=", 2)[0]) {
+			t.Errorf("missing %s in %v", want, env)
+		}
+	}
+	if got := ProcessEnv([]string{"PATH=/x"}, "box", false); got[0] != "PATH=/x" || hasEnv(got, "TERM") {
+		t.Errorf("PATH overridden or TERM set without a tty: %v", got)
 	}
 }
