@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/saiaunghlyanhtet/netker/internal/cli.Version=$(VERSION)
 
-.PHONY: build test test-integration test-ebpf e2e e2e-root check fmt vet
+.PHONY: build test test-integration test-ebpf e2e e2e-root e2e-ubuntu check fmt vet
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/netker ./cmd/netker
@@ -41,3 +41,11 @@ e2e-root: build
 	docker run --rm --privileged --tmpfs /var/lib/netker -v $(CURDIR):/src:ro -w /src alpine:latest sh -c \
 		'apk add -q bash crun nftables curl iproute2 && mount -t bpf bpf /sys/fs/bpf && \
 		 export PATH=/src/bin:$$PATH && netker system check; netker pull alpine >/dev/null && hack/e2e.sh'
+
+# The e2e suite with Ubuntu 24.04's userspace (crun 1.14, iproute2 6.1), as
+# on the GitHub runners, which is older than most dev machines.
+e2e-ubuntu: build
+	docker run --rm --privileged --tmpfs /var/lib/netker -v $(CURDIR):/src:ro -w /src ubuntu:24.04 bash -c \
+		'export DEBIAN_FRONTEND=noninteractive && apt-get update -qq >/dev/null && \
+		 apt-get install -y -qq crun nftables curl iproute2 >/dev/null 2>&1 && mount -t bpf bpf /sys/fs/bpf && \
+		 export PATH=/src/bin:$$PATH && netker pull alpine >/dev/null && hack/e2e.sh'

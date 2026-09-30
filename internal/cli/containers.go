@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/saiaunghlyanhtet/netker/internal/container"
+	"github.com/saiaunghlyanhtet/netker/internal/netkit"
 )
 
 func stopCmd() *cobra.Command {
@@ -216,9 +217,10 @@ func inspectCmd() *cobra.Command {
 			m := manager()
 			type view struct {
 				*container.Container
-				Status string `json:"status"`
-				Bundle string `json:"bundle"`
-				Log    string `json:"log_path"`
+				Status  string               `json:"status"`
+				Bundle  string               `json:"bundle"`
+				Log     string               `json:"log_path"`
+				Devices []*netkit.DeviceInfo `json:"netkit_devices"`
 			}
 			var out []view
 			for _, ref := range args {
@@ -226,7 +228,13 @@ func inspectCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				out = append(out, view{c, m.Status(c), m.Paths.Container(c.ID) + "/bundle", m.LogPath(c.ID)})
+				v := view{c, m.Status(c), m.Paths.Container(c.ID) + "/bundle", m.LogPath(c.ID), []*netkit.DeviceInfo{}}
+				for _, ep := range c.Endpoints {
+					if d, err := netkit.Describe(ep.HostIf); err == nil {
+						v.Devices = append(v.Devices, d)
+					}
+				}
+				out = append(out, v)
 			}
 			return printJSON(cmd, out)
 		},

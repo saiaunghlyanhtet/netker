@@ -33,6 +33,11 @@ type SpecOptions struct {
 	Rootfs                              string // absolute path, used to resolve users
 }
 
+// ociVersion is what the spec declares. Older crun (1.14.1, shipped by
+// Ubuntu 24.04) rejects any ociVersion without "1.0" in it, and nothing
+// netker uses is newer than runtime-spec 1.0.
+const ociVersion = "1.0.2"
+
 // Same default capability set as Docker.
 var defaultCaps = []string{
 	"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD",
@@ -49,18 +54,11 @@ func Spec(o SpecOptions) (*specs.Spec, error) {
 	if cwd == "" {
 		cwd = "/"
 	}
-	env := o.Env
-	if !hasEnv(env, "PATH") {
-		env = append([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, env...)
-	}
-	if o.Tty && !hasEnv(env, "TERM") {
-		env = append(env, "TERM=xterm")
-	}
-	env = append(env, "HOSTNAME="+o.Hostname)
+	env := ProcessEnv(o.Env, o.Hostname, o.Tty)
 
 	caps := append([]string(nil), defaultCaps...)
 	s := &specs.Spec{
-		Version:  specs.Version,
+		Version:  ociVersion,
 		Hostname: o.Hostname,
 		Root:     &specs.Root{Path: "rootfs"},
 		Process: &specs.Process{
@@ -129,6 +127,19 @@ func nofileLimit() specs.POSIXRlimit {
 		limit = rl.Max
 	}
 	return specs.POSIXRlimit{Type: "RLIMIT_NOFILE", Hard: limit, Soft: limit}
+}
+
+// ProcessEnv is the environment of a container process: env plus the
+// defaults every container gets (PATH if unset, HOSTNAME, TERM with a tty).
+func ProcessEnv(env []string, hostname string, tty bool) []string {
+	out := append([]string(nil), env...)
+	if !hasEnv(out, "PATH") {
+		out = append([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, out...)
+	}
+	if tty && !hasEnv(out, "TERM") {
+		out = append(out, "TERM=xterm")
+	}
+	return append(out, "HOSTNAME="+hostname)
 }
 
 func hasEnv(env []string, key string) bool {
