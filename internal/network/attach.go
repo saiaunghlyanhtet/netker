@@ -63,20 +63,22 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err != nil {
 		return nil, err
 	}
+	hostIf := HostIfName(containerID, idx)
 	ep = &Endpoint{
 		Network:  n.Name,
 		IfName:   fmt.Sprintf("eth%d", idx),
-		HostIf:   HostIfName(containerID, idx),
+		HostIf:   hostIf,
 		IP:       ip,
 		Gateway:  n.Gateway,
 		Mode:     n.Mode,
 		Datapath: mode,
 	}
 	defer func() {
+		// Not ep: "return nil, err" has already cleared it.
 		if err != nil {
-			_ = netkit.Delete(ep.HostIf)
+			_ = netkit.Delete(hostIf)
 			if mode == DatapathEBPF {
-				_ = s.dp.Detach(containerID, ep.HostIf, ip)
+				_ = s.dp.Detach(containerID, hostIf, ip)
 			}
 			_ = pool.Release(ip)
 		}
@@ -129,6 +131,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 			HostIfIndex: ep.HostIfIndex,
 			PeerIfIndex: peer.Attrs().Index,
 			NetID:       datapath.NetID(n.Name),
+			Internal:    n.Internal,
 			HostMAC:     host.Attrs().HardwareAddr,
 			PeerMAC:     peer.Attrs().HardwareAddr,
 		})
@@ -238,6 +241,11 @@ func setupContainerSide(ep *Endpoint, defaultRoute bool) error {
 	}
 	if err := netlink.AddrAdd(l, &netlink.Addr{IPNet: hostNet(ep.IP)}); err != nil {
 		return fmt.Errorf("address %s: %w", ep.IP, err)
+	}
+	// No IPv6 on netker networks yet, so don't let the container send
+	// router solicitations and MLD reports (Docker does the same).
+	if err := writeSysctl(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ep.IfName), "1"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if err := netlink.LinkSetUp(l); err != nil {
 		return err

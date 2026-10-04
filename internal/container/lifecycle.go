@@ -239,7 +239,7 @@ func (m *Manager) setupNetwork(c *Container, ip netip.Addr) error {
 	if err := m.save(c); err != nil {
 		return err
 	}
-	return network.PublishPorts(c.ID, ep.IP.String(), c.Ports)
+	return m.Networks.Publish(c.ID, ep, c.Ports)
 }
 
 func (m *Manager) writeEtcFiles(c *Container) error {
@@ -419,7 +419,7 @@ func (m *Manager) teardown(c *Container) error {
 		errs = append(errs, err)
 	}
 	if len(c.Ports) > 0 {
-		if err := network.UnpublishPorts(c.ID); err != nil {
+		if err := m.Networks.Unpublish(c.ID, c.Endpoints, c.Ports); err != nil {
 			errs = append(errs, err)
 		}
 	}

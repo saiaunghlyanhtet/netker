@@ -5,11 +5,14 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
@@ -29,6 +32,7 @@ func ebpfStore(t *testing.T) (*Store, string) {
 		t.Skipf("eBPF datapath not loadable here: %v", err)
 	}
 	t.Cleanup(func() {
+		s.dp.ResetHost()
 		s.dp.Close()
 		os.RemoveAll(bpffs)
 	})
@@ -59,6 +63,15 @@ func metric(t *testing.T, s *Store, ifindex int, reason string) uint64 {
 		}
 	}
 	return n
+}
+
+// dumpMetrics logs every datapath counter; call it when a test fails.
+func dumpMetrics(t *testing.T, s *Store) {
+	t.Helper()
+	ms, _ := s.dp.Metrics()
+	for _, m := range ms {
+		t.Logf("  ifindex %d %s %s: %d packets", m.Ifindex, m.Direction, m.Reason, m.Packets)
+	}
 }
 
 func TestEBPFAttachIsFailClosed(t *testing.T) {
@@ -204,8 +217,9 @@ func TestEBPFUpgradeKeepsTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated != 4 {
-		t.Fatalf("updated %d links, want 4", updated)
+	hostLinks, _ := s.dp.HostLinks()
+	if want := len(before) + len(hostLinks); updated != want || len(before) != 4 {
+		t.Fatalf("updated %d links, want %d (4 container links + %d host hooks)", updated, want, len(hostLinks))
 	}
 	after, _ := s.dp.Links()
 	for i := range before {
@@ -216,5 +230,258 @@ func TestEBPFUpgradeKeepsTraffic(t *testing.T) {
 	listenIn(t, nsB, epB.IP.String()+":9000")
 	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
 		t.Fatalf("A->B after upgrade: %q, %v", got, err)
+	}
+}
+
+// world builds a fake uplink: uplink0 (198.51.100.2) in the test netns,
+// which plays the host, and its peer in a separate "internet" netns
+// (198.51.100.1). The netker nft table is deleted so that anything that
+// works can only have been translated in BPF.
+type world struct {
+	ns     string
+	hostIP netip.Addr
+	peerIP netip.Addr
+}
+
+func setupWorld(t *testing.T, s *Store) *world {
+	t.Helper()
+	t.Setenv("NETKER_UPLINKS", "uplink0")
+	w := &world{
+		ns:     newNS(t, s.paths, "world"),
+		hostIP: netip.MustParseAddr("198.51.100.2"),
+		peerIP: netip.MustParseAddr("198.51.100.1"),
+	}
+	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "uplink0"}, PeerName: "wld0"}
+	if err := netlink.LinkAdd(veth); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { netlink.LinkDel(veth) })
+	up, _ := netlink.LinkByName("uplink0")
+	netlink.AddrAdd(up, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.hostIP.AsSlice()), Mask: net.CIDRMask(24, 32)}})
+	netlink.LinkSetUp(up)
+	peer, _ := netlink.LinkByName("wld0")
+	ns, err := os.Open(w.ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	if err := netlink.LinkSetNsFd(peer, int(ns.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	err = netns.Do(w.ns, func() error {
+		l, err := netlink.LinkByName("wld0")
+		if err != nil {
+			return err
+		}
+		netlink.AddrAdd(l, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.peerIP.AsSlice()), Mask: net.CIDRMask(24, 32)}})
+		netlink.LinkSetUp(l)
+		return netns.LoopbackUp()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+func dropNFT(t *testing.T) {
+	t.Helper()
+	exec.Command("nft", "delete", "table", "ip", "netker").Run()
+}
+
+// listenRemoteIn replies with the address the connection came from.
+func listenRemoteIn(t *testing.T, nsPath, addr string) {
+	t.Helper()
+	var ln net.Listener
+	err := netns.Do(nsPath, func() error {
+		var err error
+		ln, err = net.Listen("tcp4", addr)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			fmt.Fprint(c, c.RemoteAddr().String())
+			c.Close()
+		}
+	}()
+}
+
+func TestEBPFMasquerade(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n, _ := s.Get(DefaultName)
+	ep, ns := attachT(t, s, n, "a6a6a6a6a6a6a6a6")
+	dropNFT(t)
+
+	listenRemoteIn(t, w.ns, w.peerIP.String()+":7000")
+	got, err := dialIn(ns, w.peerIP.String()+":7000")
+	if err != nil {
+		t.Fatalf("container->world: %v", err)
+	}
+	src, err := netip.ParseAddrPort(got)
+	if err != nil {
+		t.Fatalf("server saw %q", got)
+	}
+	if src.Addr() != w.hostIP || src.Port() < 61000 {
+		t.Fatalf("server saw %s, want %s with a NAT port >= 61000", src, w.hostIP)
+	}
+	if metric(t, s, ep.HostIfIndex, "snat") == 0 || metric(t, s, ep.HostIfIndex, "rev-snat") == 0 {
+		t.Fatal("masquerading was not done in BPF")
+	}
+}
+
+func TestEBPFPublishedPorts(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n, _ := s.Get(DefaultName)
+	epA, nsA := attachT(t, s, n, "a7a7a7a7a7a7a7a7")
+	epB, nsB := attachT(t, s, n, "b7b7b7b7b7b7b7b7")
+	listenIn(t, nsB, epB.IP.String()+":80")
+	ports := []PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	if err := s.Publish("b7b7b7b7b7b7b7b7", epB, ports); err != nil {
+		t.Fatal(err)
+	}
+	dropNFT(t)
+	hostPort := w.hostIP.String() + ":8080"
+
+	t.Run("from the world", func(t *testing.T) {
+		if got, err := dialIn(w.ns, hostPort); err != nil || got != "hello from netker" {
+			t.Fatalf("%q, %v", got, err)
+		}
+		if metric(t, s, epB.HostIfIndex, "dnat") == 0 || metric(t, s, epB.HostIfIndex, "rev-dnat") == 0 {
+			t.Fatal("published port not translated in BPF")
+		}
+	})
+	t.Run("from the host via localhost", func(t *testing.T) {
+		if got, err := dialIn("", "127.0.0.1:8080"); err != nil || got != "hello from netker" {
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("from the host via its own address", func(t *testing.T) {
+		if got, err := dialIn("", hostPort); err != nil || got != "hello from netker" {
+			dumpMetrics(t, s)
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("from the host via an address added after publishing", func(t *testing.T) {
+		d := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "late0"}}
+		if err := netlink.LinkAdd(d); err != nil {
+			t.Fatal(err)
+		}
+		defer netlink.LinkDel(d)
+		netlink.AddrAdd(d, &netlink.Addr{IPNet: hostNet(netip.MustParseAddr("203.0.113.7"))})
+		netlink.LinkSetUp(d)
+		if got, err := dialIn("", "203.0.113.7:8080"); err != nil || got != "hello from netker" {
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("hairpin from another container", func(t *testing.T) {
+		if got, err := dialIn(nsA, hostPort); err != nil || got != "hello from netker" {
+			t.Fatalf("%q, %v", got, err)
+		}
+		if metric(t, s, epA.HostIfIndex, "dnat") == 0 {
+			t.Fatal("hairpin not translated in BPF")
+		}
+	})
+	t.Run("container's own localhost is untouched", func(t *testing.T) {
+		if _, err := dialIn(nsA, "127.0.0.1:8080"); err == nil {
+			t.Fatal("127.0.0.1 inside a container was redirected")
+		}
+	})
+	t.Run("port already allocated", func(t *testing.T) {
+		if err := s.Publish("a7a7a7a7a7a7a7a7", epA, ports); err == nil {
+			t.Fatal("publishing a taken port succeeded")
+		}
+	})
+	t.Run("unpublish", func(t *testing.T) {
+		if err := s.Unpublish("b7b7b7b7b7b7b7b7", []*Endpoint{epB}, ports); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dialIn(w.ns, hostPort); err == nil {
+			t.Fatal("port still reachable after unpublish")
+		}
+	})
+}
+
+func TestEBPFPingThroughNAT(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n, _ := s.Get(DefaultName)
+	ep, ns := attachT(t, s, n, "a8a8a8a8a8a8a8a8")
+	dropNFT(t)
+
+	err := netns.Do(ns, func() error {
+		c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: 4242, Seq: 1, Data: []byte("netker")}}
+		b, _ := msg.Marshal(nil)
+		if _, err := c.WriteTo(b, &net.IPAddr{IP: net.IP(w.peerIP.AsSlice())}); err != nil {
+			return err
+		}
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := c.ReadFrom(buf)
+			if err != nil {
+				return fmt.Errorf("no echo reply: %w", err)
+			}
+			m, err := icmp.ParseMessage(1, buf[:n])
+			if err != nil || m.Type != ipv4.ICMPTypeEchoReply {
+				continue
+			}
+			if e := m.Body.(*icmp.Echo); e.ID != 4242 {
+				return fmt.Errorf("reply id %d, want the original 4242", e.ID)
+			}
+			if from.String() != w.peerIP.String() {
+				return fmt.Errorf("reply from %s", from)
+			}
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric(t, s, ep.HostIfIndex, "rev-snat") == 0 {
+		t.Fatal("echo reply was not un-masqueraded in BPF")
+	}
+}
+
+func TestEBPFInternalNetwork(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n := &Network{Name: "sealed", Subnet: netip.MustParsePrefix("10.96.0.0/24"), Internal: true}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	epA, nsA := attachT(t, s, n, "a9a9a9a9a9a9a9a9")
+	epB, nsB := attachT(t, s, n, "b9b9b9b9b9b9b9b9")
+	dropNFT(t)
+	listenRemoteIn(t, w.ns, w.peerIP.String()+":7000")
+	if _, err := dialIn(nsA, w.peerIP.String()+":7000"); err == nil {
+		t.Fatal("container on an internal network reached the outside world")
+	}
+	if metric(t, s, epA.HostIfIndex, "drop-policy") == 0 {
+		t.Fatal("internal egress not dropped by policy")
+	}
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("containers on the same internal network: %q, %v", got, err)
+	}
+	listenIn(t, nsB, epB.IP.String()+":80")
+	if err := s.Publish("b9b9b9b9b9b9b9b9", epB, []PortMapping{{HostPort: 8081, ContainerPort: 80, Protocol: "tcp"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dialIn(w.ns, w.hostIP.String()+":8081"); err == nil {
+		t.Fatal("internal container reachable from the world through a published port")
 	}
 }

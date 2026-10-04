@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/saiaunghlyanhtet/netker/internal/config"
+	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
 )
 
@@ -69,6 +70,15 @@ func checkCmd() *cobra.Command {
 				checks = append(checks, check{name: "eBPF datapath", ok: true})
 			}
 			dp.Close()
+
+			if r, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+				var lo, hi int
+				fmt.Sscan(string(r), &lo, &hi)
+				overlap := hi >= datapath.NATPortMin && lo <= datapath.NATPortMax
+				checks = append(checks, check{name: "NAT port range", ok: !overlap, warn: overlap,
+					detail: fmt.Sprintf("ip_local_port_range %d-%d overlaps the BPF NAT ports %d-%d: host connections may collide with masqueraded ones",
+						lo, hi, datapath.NATPortMin, datapath.NATPortMax)})
+			}
 
 			for _, bin := range []string{config.Runtime(), "nft"} {
 				p, err := exec.LookPath(bin)

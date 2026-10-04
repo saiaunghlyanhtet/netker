@@ -43,6 +43,8 @@ Commands: `run create start stop restart kill rm ps exec logs inspect port`,
 ```sh
 sudo bin/netker system datapath status    # pinned links, endpoint map, counters per verdict
 sudo bin/netker system datapath upgrade   # swap every container's programs atomically
+sudo bin/netker system datapath sync      # attach to uplinks that appeared since
+sudo bin/netker system datapath reset-host  # detach uplink/lo/cgroup hooks
 ```
 
 ## Try it without root
@@ -70,12 +72,23 @@ go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
 
 ## Known gaps
 
-- Published ports aren't reachable through `127.0.0.1`. Use a host address.
-  (The BPF datapath will handle this with a cgroup `connect` hook.)
+- eBPF datapath:
+  - NAT state is an LRU map with no TCP state or timeouts; idle flows are evicted
+    only when it fills (256k entries).
+  - ICMP errors (e.g. port unreachable) for masqueraded flows aren't translated back.
+  - Unconnected UDP to `127.0.0.1:<published port>` isn't redirected (no
+    `sendmsg4`/`recvmsg4` hooks yet); connected UDP and TCP are.
+  - It sets `net.ipv4.conf.lo.accept_local=1`: replies to the host's
+    connections to its own address on a published port are injected into `lo`
+    without a route, and the kernel would otherwise drop their local source
+    address. `netker system datapath reset-host` restores the old value.
+  - Netfilter is bypassed for container traffic, so host firewalls (firewalld,
+    nftables policies) don't see it, as with Cilium's eBPF host routing.
+  - No IPv6.
+- Legacy datapath: published ports aren't reachable through `127.0.0.1`.
 - There is no shim yet, so exit codes of detached containers aren't recorded, and
   `--rm` only works for foreground runs.
 - No seccomp profile, resource limits, or container name DNS yet.
-- On hosts running firewalld, its forward policy may drop routed container traffic.
 
 ## License
 

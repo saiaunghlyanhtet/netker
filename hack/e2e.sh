@@ -41,14 +41,26 @@ if [[ "$datapath" == ebpf ]]; then
 	status=$(netker system datapath status)
 	expect "eBPF: programs pinned on both sides" "primary" "$status"
 	expect "eBPF: container->container was redirected in BPF" "forward-local" "$status"
-	expect "eBPF: upgrade swaps programs in place" "updated 2 link(s)" "$(netker system datapath upgrade)"
+	updated=$(netker system datapath upgrade | sed -n 's/updated \([0-9]*\) link.*/\1/p')
+	(( updated >= 2 )) || fail "eBPF: upgrade updated '$updated' links, want the container's 2 plus host hooks"
+	echo "ok: eBPF: upgrade swapped $updated programs in place"
 	expect "eBPF: traffic flows after upgrade" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
 fi
 
 ip link add e2e-pub0 type dummy
 ip addr add 192.0.2.10/24 dev e2e-pub0
 ip link set e2e-pub0 up
-expect "published port" "hello from" "$(curl -s --max-time 3 http://192.0.2.10:8080/)"
+expect "published port (address added after the container started)" "hello from" "$(curl -s --max-time 3 http://192.0.2.10:8080/)"
+if [[ "$datapath" == ebpf ]]; then
+	expect "eBPF: published port on 127.0.0.1" "hello from" "$(curl -s --max-time 3 http://127.0.0.1:8080/)"
+	expect "eBPF: port published in BPF, not nftables" "0.0.0.0:8080/tcp" "$(netker system datapath status)"
+	if nft list table ip netker 2>/dev/null | grep -q "dport 8080"; then fail "eBPF endpoint got nftables DNAT rules"; fi
+	echo "ok: eBPF: no nftables DNAT rules for the port"
+	if [[ -n "${E2E_INTERNET:-}" ]]; then
+		expect "eBPF: container reaches the internet" "Example Domain" "$(netker exec e2e-web wget -T 5 -qO- http://example.com)"
+		expect "eBPF: internet traffic masqueraded in BPF" "rev-snat" "$(netker system datapath status)"
+	fi
+fi
 
 expect "logs" "serving" "$(netker logs e2e-web)"
 expect "exec" "e2e" "$(netker exec -e X=e2e e2e-web sh -c 'echo $X')"
