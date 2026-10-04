@@ -24,6 +24,11 @@ import (
 func ebpfStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	requireNetAdmin(t)
+	// The test netns plays the host, and a host's own addresses are only
+	// reachable over lo. A fresh "unshare --net" (as in CI) has lo down.
+	if err := netns.LoopbackUp(); err != nil {
+		t.Fatal(err)
+	}
 	bpffs := filepath.Join("/sys/fs/bpf", fmt.Sprintf("netker-test-%d", time.Now().UnixNano()))
 	t.Setenv("NETKER_BPFFS", bpffs)
 	t.Setenv("NETKER_DATAPATH", "ebpf")

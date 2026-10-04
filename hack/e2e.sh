@@ -15,6 +15,9 @@ cleanup() {
 }
 trap cleanup EXIT
 cleanup
+# This namespace plays the host; a fresh "unshare --net" (as in CI) has lo
+# down, and a host's connections to its own addresses go over lo.
+ip link set lo up
 
 netker run -d --name e2e-web -p 8080:80 alpine sh -c \
 	'echo serving; while true; do printf "HTTP/1.0 200 OK\r\n\r\nhello from $(hostname)\n" | nc -l -p 80; done' >/dev/null
