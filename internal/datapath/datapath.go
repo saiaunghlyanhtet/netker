@@ -24,9 +24,13 @@ type Endpoint struct {
 	HostIfIndex int
 	PeerIfIndex int // ifindex inside the container netns
 	NetID       uint32
+	Internal    bool // network without external connectivity
 	HostMAC     net.HardwareAddr
 	PeerMAC     net.HardwareAddr
 }
+
+// Endpoint flags, EP_F_* in bpf/lib/maps.h.
+const flagInternal = 0x1
 
 // NetID derives a network's numeric ID from its name.
 func NetID(network string) uint32 { return crc32.ChecksumIEEE([]byte(network)) }
@@ -84,6 +88,9 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 		PeerIfindex: uint32(ep.PeerIfIndex),
 		Netid:       ep.NetID,
 	}
+	if ep.Internal {
+		val.Flags |= flagInternal
+	}
 	copy(val.Mac[:], ep.HostMAC)
 	copy(val.PeerMac[:], ep.PeerMAC)
 	key := ep.IP.As4()
@@ -116,7 +123,7 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 			return fmt.Errorf("pin %s link: %w", a.side, err)
 		}
 	}
-	return nil
+	return d.EnsureHost()
 }
 
 // Detach removes the endpoint and releases its links. Missing pieces are
@@ -188,7 +195,35 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 			entries++
 		}
 	}
-	return links, entries, it.Err()
+	if err := it.Err(); err != nil {
+		return links, entries, err
+	}
+	// Published ports whose container is gone.
+	var pk netkerPortKey
+	var pv netkerPortVal
+	var stalePorts []netkerPortKey
+	pit := d.objs.NetkerPorts.Iterate()
+	for pit.Next(&pk, &pv) {
+		var ep netkerEndpoint
+		addr := addrFromBE32(pv.CtrAddr).As4()
+		if d.objs.NetkerEndpoints.Lookup(addr, &ep) != nil {
+			stalePorts = append(stalePorts, pk)
+		}
+	}
+	for _, k := range stalePorts {
+		if d.objs.NetkerPorts.Delete(k) == nil {
+			entries++
+		}
+	}
+	// Uplink links of interfaces that disappeared.
+	hls, _ := d.HostLinks()
+	for _, hl := range hls {
+		if hl.Defunct {
+			os.Remove(hl.Pin)
+			links++
+		}
+	}
+	return links, entries, pit.Err()
 }
 
 // EndpointEntry is one row of the endpoint map.
@@ -279,8 +314,15 @@ func (d *Datapath) Upgrade() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n := 0
-	var errs []error
+	hostLinks, err := d.HostLinks()
+	if err != nil {
+		return 0, err
+	}
+	type target struct {
+		pin  string
+		prog *ebpf.Program
+	}
+	var targets []target
 	for _, li := range links {
 		if li.Defunct {
 			continue
@@ -289,13 +331,31 @@ func (d *Datapath) Upgrade() (int, error) {
 		if li.Side == "primary" {
 			prog = d.objs.NkToContainer
 		}
-		l, err := link.LoadPinnedLink(li.Pin, nil)
+		targets = append(targets, target{li.Pin, prog})
+	}
+	for _, hl := range hostLinks {
+		if hl.Defunct {
+			continue
+		}
+		prog := d.objs.NkFromWorld
+		switch hl.Kind {
+		case "connect4":
+			prog = d.objs.NkSockConnect4
+		case "loopback":
+			prog = d.objs.NkFromLo
+		}
+		targets = append(targets, target{hl.Pin, prog})
+	}
+	n := 0
+	var errs []error
+	for _, t := range targets {
+		l, err := link.LoadPinnedLink(t.pin, nil)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if err := l.Update(prog); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", li.Pin, err))
+		if err := l.Update(t.prog); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", t.pin, err))
 		} else {
 			n++
 		}
@@ -307,7 +367,9 @@ func (d *Datapath) Upgrade() (int, error) {
 // Reasons names the datapath's metric reasons (enum reason in bpf/netker.c).
 var Reasons = map[uint8]string{
 	1: "forward-local", 2: "pass-stack", 3: "pass-arp", 4: "deliver",
+	5: "snat", 6: "rev-snat", 7: "dnat", 8: "rev-dnat",
 	10: "drop-spoof", 11: "drop-policy", 12: "drop-not-ours", 13: "drop-proto", 14: "drop-malformed",
+	15: "drop-nat-exhausted", 16: "drop-mcast",
 }
 
 type Metric struct {

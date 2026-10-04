@@ -40,7 +40,7 @@ test-ebpf:
 e2e-root: build
 	docker run --rm --privileged --tmpfs /var/lib/netker -v $(CURDIR):/src:ro -w /src alpine:latest sh -c \
 		'apk add -q bash crun nftables curl iproute2 && mount -t bpf bpf /sys/fs/bpf && \
-		 export PATH=/src/bin:$$PATH && netker system check; netker pull alpine >/dev/null && hack/e2e.sh'
+		 export PATH=/src/bin:$$PATH && netker system check; netker pull alpine >/dev/null && E2E_INTERNET=1 hack/e2e.sh'
 
 # The e2e suite with Ubuntu 24.04's userspace (crun 1.14, iproute2 6.1), as
 # on the GitHub runners, which is older than most dev machines.

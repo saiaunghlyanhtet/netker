@@ -1,10 +1,9 @@
 // Package network manages netker networks and connects containers to them
 // with netkit pairs.
 //
-// This is the "netkit-legacy" datapath from docs/DESIGN.md: netkit devices
-// with forwarding done by the host stack and NAT by nftables. The eBPF
-// datapath replaces the forwarding and NAT parts later; the device setup
-// here stays the same.
+// The device setup is the same for both datapaths. With the eBPF datapath
+// (internal/datapath) BPF programs on the devices forward and NAT; with the
+// legacy one the host stack forwards and nftables does NAT.
 package network
 
 import (

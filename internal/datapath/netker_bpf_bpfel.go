@@ -13,6 +13,14 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type netkerConfig struct {
+	_               structs.HostLayout
+	HostNetnsCookie uint64
+	NatPortMin      uint16
+	NatPortMax      uint16
+	Pad             uint32
+}
+
 type netkerEndpoint struct {
 	_           structs.HostLayout
 	Ifindex     uint32
@@ -35,6 +43,42 @@ type netkerMetricsVal struct {
 	_       structs.HostLayout
 	Packets uint64
 	Bytes   uint64
+}
+
+type netkerNatKey struct {
+	_     structs.HostLayout
+	Saddr uint32
+	Daddr uint32
+	Sport uint16
+	Dport uint16
+	Proto uint8
+	Dir   uint8
+	Pad   uint16
+}
+
+type netkerNatVal struct {
+	_       structs.HostLayout
+	Addr    uint32
+	Port    uint16
+	Pad     uint16
+	Ifindex uint32
+	Pad2    uint32
+}
+
+type netkerPortKey struct {
+	_     structs.HostLayout
+	Addr  uint32
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type netkerPortVal struct {
+	_       structs.HostLayout
+	CtrAddr uint32
+	CtrPort uint16
+	Pad     uint16
+	Ifindex uint32
 }
 
 // loadNetker returns the embedded CollectionSpec for netker.
@@ -80,6 +124,9 @@ type netkerSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type netkerProgramSpecs struct {
 	NkFromContainer *ebpf.ProgramSpec `ebpf:"nk_from_container"`
+	NkFromLo        *ebpf.ProgramSpec `ebpf:"nk_from_lo"`
+	NkFromWorld     *ebpf.ProgramSpec `ebpf:"nk_from_world"`
+	NkSockConnect4  *ebpf.ProgramSpec `ebpf:"nk_sock_connect4"`
 	NkToContainer   *ebpf.ProgramSpec `ebpf:"nk_to_container"`
 }
 
@@ -87,8 +134,11 @@ type netkerProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type netkerMapSpecs struct {
+	NetkerConfig    *ebpf.MapSpec `ebpf:"netker_config"`
 	NetkerEndpoints *ebpf.MapSpec `ebpf:"netker_endpoints"`
 	NetkerMetrics   *ebpf.MapSpec `ebpf:"netker_metrics"`
+	NetkerNat       *ebpf.MapSpec `ebpf:"netker_nat"`
+	NetkerPorts     *ebpf.MapSpec `ebpf:"netker_ports"`
 }
 
 // netkerVariableSpecs contains global variables before they are loaded into the kernel.
@@ -117,14 +167,20 @@ func (o *netkerObjects) Close() error {
 //
 // It can be passed to loadNetkerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netkerMaps struct {
+	NetkerConfig    *ebpf.Map `ebpf:"netker_config"`
 	NetkerEndpoints *ebpf.Map `ebpf:"netker_endpoints"`
 	NetkerMetrics   *ebpf.Map `ebpf:"netker_metrics"`
+	NetkerNat       *ebpf.Map `ebpf:"netker_nat"`
+	NetkerPorts     *ebpf.Map `ebpf:"netker_ports"`
 }
 
 func (m *netkerMaps) Close() error {
 	return _NetkerClose(
+		m.NetkerConfig,
 		m.NetkerEndpoints,
 		m.NetkerMetrics,
+		m.NetkerNat,
+		m.NetkerPorts,
 	)
 }
 
@@ -139,12 +195,18 @@ type netkerVariables struct {
 // It can be passed to loadNetkerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netkerPrograms struct {
 	NkFromContainer *ebpf.Program `ebpf:"nk_from_container"`
+	NkFromLo        *ebpf.Program `ebpf:"nk_from_lo"`
+	NkFromWorld     *ebpf.Program `ebpf:"nk_from_world"`
+	NkSockConnect4  *ebpf.Program `ebpf:"nk_sock_connect4"`
 	NkToContainer   *ebpf.Program `ebpf:"nk_to_container"`
 }
 
 func (p *netkerPrograms) Close() error {
 	return _NetkerClose(
 		p.NkFromContainer,
+		p.NkFromLo,
+		p.NkFromWorld,
+		p.NkSockConnect4,
 		p.NkToContainer,
 	)
 }
