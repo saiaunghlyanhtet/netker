@@ -32,6 +32,7 @@ sudo bin/netker run --rm alpine wget -qO- http://<web IP>/
 
 sudo bin/netker network create --subnet 10.99.0.0/24 --netkit-mode l2 lab
 sudo bin/netker run --rm --network lab alpine ip link
+sudo bin/netker run --rm --network netker --network lab alpine ip -4 addr   # eth0 + eth1
 
 sudo bin/netker rm -f web
 ```

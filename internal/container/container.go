@@ -35,7 +35,8 @@ type Container struct {
 	User        string                `json:"user,omitempty"`
 	Tty         bool                  `json:"tty"`
 	Hostname    string                `json:"hostname"`
-	Network     string                `json:"network"` // network name, "host" or "none"
+	Network     string                `json:"network"` // first network, "host" or "none"
+	Networks    []string              `json:"networks,omitempty"`
 	NetNSPath   string                `json:"netns,omitempty"`
 	Endpoints   []*network.Endpoint   `json:"endpoints,omitempty"`
 	Ports       []network.PortMapping `json:"ports,omitempty"`
@@ -96,7 +97,13 @@ func (m *Manager) load(id string) (*Container, error) {
 		return nil, err
 	}
 	var c Container
-	return &c, json.Unmarshal(data, &c)
+	if err := json.Unmarshal(data, &c); err != nil {
+		return nil, err
+	}
+	if len(c.Networks) == 0 && c.Network != "" {
+		c.Networks = []string{c.Network}
+	}
+	return &c, nil
 }
 
 // List returns all containers, newest first.

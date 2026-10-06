@@ -9,7 +9,8 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo >/dev/null 2>&1 || true
+	netker network rm e2e-two >/dev/null 2>&1 || true
 	netker network rm e2e-l2 >/dev/null 2>&1 || true
 	ip link del e2e-pub0 2>/dev/null || true
 }
@@ -83,6 +84,21 @@ netker network create --subnet 10.99.0.0/24 --netkit-mode l2 e2e-l2 >/dev/null
 out=$(netker run --rm --network e2e-l2 alpine sh -c 'ip link show eth0; ping -c1 -W2 10.99.0.1')
 expect "L2 network: ARP enabled on eth0" "02:" "$out"
 expect "L2 network: gateway reachable" "1 packets received" "$out"
+
+netker network create --subnet 10.94.0.0/24 e2e-two >/dev/null
+netker run -d --name e2e-solo --network e2e-two alpine sh -c \
+	'while true; do printf "HTTP/1.0 200 OK\r\n\r\nsolo\n" | nc -l -p 80; done' >/dev/null
+sleep 0.5
+solo_ip=$(netker inspect e2e-solo | sed -n 's/.*"ip": "\(.*\)".*/\1/p' | head -1)
+out=$(netker run --rm --network netker --network e2e-two alpine sh -c "ip -o -4 addr show; ip route; wget -T 3 -qO- http://$solo_ip/")
+expect "two networks: eth0 on the first" "eth0    inet 10.87." "$out"
+expect "two networks: eth1 on the second" "eth1    inet 10.94." "$out"
+expect "two networks: default route on eth0" "default via 10.87.0.1 dev eth0" "$out"
+expect "two networks: reaches a container on the second network" "solo" "$out"
+if netker run --rm --network host --network e2e-two alpine true 2>/dev/null; then fail "--network host combined with another network was accepted"; fi
+echo "ok: --network host can't be combined with other networks"
+netker rm -f e2e-solo >/dev/null
+netker network rm e2e-two >/dev/null
 
 expect "--network none has only lo" "1: lo" "$(netker run --rm --network none alpine ip -o link)"
 

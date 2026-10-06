@@ -86,6 +86,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 
 	spec := netkit.PairSpec{
 		ContainerID: containerID,
+		Index:       idx,
 		HostName:    ep.HostIf,
 		PeerName:    ep.IfName,
 		NetNSPath:   nsPath,
@@ -110,7 +111,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	}
 	var peer netlink.Link
 	err = netns.Do(nsPath, func() error {
-		if err := setupContainerSide(ep, idx == 0); err != nil {
+		if err := setupContainerSide(ep, n.Subnet, idx == 0); err != nil {
 			return err
 		}
 		peer, err = netlink.LinkByName(ep.IfName)
@@ -227,7 +228,11 @@ func setupHostSide(ep *Endpoint) error {
 	return nil
 }
 
-func setupContainerSide(ep *Endpoint, defaultRoute bool) error {
+// setupContainerSide configures the container's end. The first attachment
+// carries the default route; later ones get a route to their own subnet, so
+// traffic to that network leaves through its interface (and BPF sees it on
+// the right endpoint).
+func setupContainerSide(ep *Endpoint, subnet netip.Prefix, defaultRoute bool) error {
 	lo, err := netlink.LinkByName("lo")
 	if err != nil {
 		return err
@@ -257,13 +262,17 @@ func setupContainerSide(ep *Endpoint, defaultRoute bool) error {
 	}); err != nil {
 		return fmt.Errorf("route to gateway: %w", err)
 	}
-	if !defaultRoute {
-		return nil
-	}
-	return netlink.RouteAdd(&netlink.Route{
+	route := &netlink.Route{
 		LinkIndex: l.Attrs().Index,
 		Gw:        net.IP(ep.Gateway.AsSlice()),
-	})
+	}
+	if !defaultRoute {
+		route.Dst = &net.IPNet{IP: net.IP(subnet.Masked().Addr().AsSlice()), Mask: net.CIDRMask(subnet.Bits(), 32)}
+	}
+	if err := netlink.RouteAdd(route); err != nil {
+		return fmt.Errorf("route via %s: %w", ep.Gateway, err)
+	}
+	return nil
 }
 
 func hostNet(a netip.Addr) *net.IPNet {
