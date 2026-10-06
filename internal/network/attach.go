@@ -25,6 +25,8 @@ type Endpoint struct {
 	IP      netip.Addr  `json:"ip"`
 	Gateway netip.Addr  `json:"gateway"`
 	Mode    netkit.Mode `json:"netkit_mode"`
+	// Default is set on the attachment that carries the default route.
+	Default bool `json:"default_route,omitempty"`
 	// Datapath is "ebpf" or "legacy", fixed when the endpoint is created.
 	Datapath    string `json:"datapath"`
 	HostIfIndex int    `json:"host_ifindex"`
@@ -47,7 +49,9 @@ func HostIfName(containerID string, idx int) string {
 
 // Attach connects the container whose network namespace is at nsPath to
 // network n as interface eth<idx>. want optionally requests a fixed IP.
-func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want netip.Addr) (ep *Endpoint, err error) {
+// defaultRoute makes this attachment carry the container's default route;
+// otherwise it gets a route to its own subnet.
+func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want netip.Addr, defaultRoute bool) (ep *Endpoint, err error) {
 	if idx > 9 {
 		return nil, fmt.Errorf("at most 10 networks per container")
 	}
@@ -72,6 +76,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 		Gateway:  n.Gateway,
 		Mode:     n.Mode,
 		Datapath: mode,
+		Default:  defaultRoute,
 	}
 	defer func() {
 		// Not ep: "return nil, err" has already cleared it.
@@ -111,7 +116,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	}
 	var peer netlink.Link
 	err = netns.Do(nsPath, func() error {
-		if err := setupContainerSide(ep, n.Subnet, idx == 0); err != nil {
+		if err := setupContainerSide(ep, n.Subnet, defaultRoute); err != nil {
 			return err
 		}
 		peer, err = netlink.LinkByName(ep.IfName)
@@ -303,5 +308,25 @@ func writeSysctl(key, value string) error {
 	if err := os.WriteFile(p, []byte(value), 0o644); err != nil {
 		return fmt.Errorf("sysctl %s=%s: %w", key, value, err)
 	}
+	return nil
+}
+
+// SetDefaultRoute moves the container's default route to ep, e.g. after the
+// attachment that carried it was disconnected.
+func (s *Store) SetDefaultRoute(nsPath string, ep *Endpoint) error {
+	err := netns.Do(nsPath, func() error {
+		l, err := netlink.LinkByName(ep.IfName)
+		if err != nil {
+			return err
+		}
+		return netlink.RouteReplace(&netlink.Route{
+			LinkIndex: l.Attrs().Index,
+			Gw:        net.IP(ep.Gateway.AsSlice()),
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("default route via %s: %w", ep.IfName, err)
+	}
+	ep.Default = true
 	return nil
 }

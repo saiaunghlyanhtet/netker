@@ -265,7 +265,7 @@ func (m *Manager) setupNetwork(c *Container, ip netip.Addr) error {
 		if idx == 0 {
 			want = ip
 		}
-		ep, err := m.Networks.Attach(n, c.ID, c.NetNSPath, idx, want)
+		ep, err := m.Networks.Attach(n, c.ID, c.NetNSPath, idx, want, idx == 0)
 		if err != nil {
 			return err
 		}

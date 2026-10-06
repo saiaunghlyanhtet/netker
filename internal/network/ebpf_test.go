@@ -47,7 +47,7 @@ func ebpfStore(t *testing.T) (*Store, string) {
 func attachT(t *testing.T, s *Store, n *Network, id string) (*Endpoint, string) {
 	t.Helper()
 	ns := newNS(t, s.paths, id)
-	ep, err := s.Attach(n, id, ns, 0, netip.Addr{})
+	ep, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

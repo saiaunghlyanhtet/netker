@@ -103,6 +103,14 @@ func (m *Manager) load(id string) (*Container, error) {
 	if len(c.Networks) == 0 && c.Network != "" {
 		c.Networks = []string{c.Network}
 	}
+	if defaultEndpoint(&c) == nil {
+		// Written before endpoints recorded it: eth0 has the default route.
+		for _, ep := range c.Endpoints {
+			if ep.IfName == "eth0" {
+				ep.Default = true
+			}
+		}
+	}
 	return &c, nil
 }
 

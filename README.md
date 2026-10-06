@@ -33,12 +33,14 @@ sudo bin/netker run --rm alpine wget -qO- http://<web IP>/
 sudo bin/netker network create --subnet 10.99.0.0/24 --netkit-mode l2 lab
 sudo bin/netker run --rm --network lab alpine ip link
 sudo bin/netker run --rm --network netker --network lab alpine ip -4 addr   # eth0 + eth1
+sudo bin/netker network connect lab web       # hot-plug eth1 into a running container
+sudo bin/netker network disconnect lab web
 
 sudo bin/netker rm -f web
 ```
 
 Commands: `run create start stop restart kill rm ps exec logs inspect port`,
-`pull images rmi`, `network create|ls|rm|inspect`, `system check|gc`,
+`pull images rmi`, `network create|ls|rm|inspect|connect|disconnect`, `system check|gc`,
 `system datapath status|upgrade`, `version`.
 
 ```sh

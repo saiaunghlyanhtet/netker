@@ -109,7 +109,7 @@ func TestAttachL3(t *testing.T) {
 	}
 	id := "0123456789abcdef"
 	ns := newNS(t, p, id)
-	ep, err := s.Attach(n, id, ns, 0, netip.Addr{})
+	ep, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +171,11 @@ func TestContainerToContainer(t *testing.T) {
 	}
 	a, b := "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"
 	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
-	epA, err := s.Attach(n, a, nsA, 0, netip.Addr{})
+	epA, err := s.Attach(n, a, nsA, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	epB, err := s.Attach(n, b, nsB, 0, netip.Addr{})
+	epB, err := s.Attach(n, b, nsB, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestAttachL2(t *testing.T) {
 	}
 	id := "cccccccccccccccc"
 	ns := newNS(t, p, id)
-	ep, err := s.Attach(n, id, ns, 0, netip.Addr{})
+	ep, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestPublishPorts(t *testing.T) {
 	n, _ := s.Get(DefaultName)
 	id := "dddddddddddddddd"
 	ns := newNS(t, p, id)
-	ep, err := s.Attach(n, id, ns, 0, netip.Addr{})
+	ep, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,17 +263,17 @@ func TestMultipleNetworks(t *testing.T) {
 	}
 	a, b := "eeeeeeeeeeeeeeee", "ffffffffffffffff"
 	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
-	epA0, err := s.Attach(n1, a, nsA, 0, netip.Addr{})
+	epA0, err := s.Attach(n1, a, nsA, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Detach(epA0, a)
-	epA1, err := s.Attach(n2, a, nsA, 1, netip.Addr{})
+	epA1, err := s.Attach(n2, a, nsA, 1, netip.Addr{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Detach(epA1, a)
-	epB, err := s.Attach(n2, b, nsB, 0, netip.Addr{})
+	epB, err := s.Attach(n2, b, nsB, 0, netip.Addr{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,5 +310,78 @@ func TestMultipleNetworks(t *testing.T) {
 	}
 	if epA1.Datapath == DatapathEBPF && metric(t, s, epA1.HostIfIndex, "forward-local") == 0 {
 		t.Fatal("traffic on eth1 was not forwarded in BPF on the eth1 endpoint")
+	}
+}
+
+// TestHotplugAndDefaultRouteMove is what "network connect/disconnect" do:
+// attach to a namespace that already has an interface, detach the one with
+// the default route, and move the default route to what's left.
+func TestHotplugAndDefaultRouteMove(t *testing.T) {
+	requireNetAdmin(t)
+	s, p := testStore(t)
+	n1, _ := s.Get(DefaultName)
+	n2 := &Network{Name: "hot", Subnet: netip.MustParsePrefix("10.93.0.0/24")}
+	if err := s.Create(n2); err != nil {
+		t.Fatal(err)
+	}
+	id := "1212121212121212"
+	ns := newNS(t, p, id)
+	ep0, err := s.Attach(n1, id, ns, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep1, err := s.Attach(n2, id, ns, 1, netip.Addr{}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(ep1, id)
+	if ep1.Default || !ep0.Default {
+		t.Fatalf("default flags: eth0 %v, eth1 %v", ep0.Default, ep1.Default)
+	}
+
+	defaultVia := func() (string, error) {
+		var dev string
+		err := netns.Do(ns, func() error {
+			routes, err := netlink.RouteGet(net.ParseIP("1.1.1.1"))
+			if err != nil {
+				return err
+			}
+			l, err := netlink.LinkByIndex(routes[0].LinkIndex)
+			if err == nil {
+				dev = l.Attrs().Name
+			}
+			return err
+		})
+		return dev, err
+	}
+	if dev, err := defaultVia(); err != nil || dev != "eth0" {
+		t.Fatalf("default route via %q, %v; want eth0", dev, err)
+	}
+
+	if err := s.Detach(ep0, id); err != nil {
+		t.Fatal(err)
+	}
+	err = netns.Do(ns, func() error {
+		if _, err := netlink.LinkByName("eth0"); err == nil {
+			return fmt.Errorf("eth0 still exists after detach")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := defaultVia(); err == nil {
+		t.Fatal("default route survived its interface")
+	}
+	if err := s.SetDefaultRoute(ns, ep1); err != nil {
+		t.Fatal(err)
+	}
+	if dev, err := defaultVia(); err != nil || dev != "eth1" || !ep1.Default {
+		t.Fatalf("default route via %q, %v; want eth1", dev, err)
+	}
+	// eth1 still reaches the host after the move.
+	listenIn(t, "", ep1.Gateway.String()+":8085")
+	if got, err := dialIn(ns, ep1.Gateway.String()+":8085"); err != nil || got != "hello from netker" {
+		t.Fatalf("eth1 -> gateway: %q, %v", got, err)
 	}
 }

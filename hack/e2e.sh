@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none >/dev/null 2>&1 || true
 	netker network rm e2e-two >/dev/null 2>&1 || true
 	netker network rm e2e-l2 >/dev/null 2>&1 || true
 	ip link del e2e-pub0 2>/dev/null || true
@@ -97,6 +97,37 @@ expect "two networks: default route on eth0" "default via 10.87.0.1 dev eth0" "$
 expect "two networks: reaches a container on the second network" "solo" "$out"
 if netker run --rm --network host --network e2e-two alpine true 2>/dev/null; then fail "--network host combined with another network was accepted"; fi
 echo "ok: --network host can't be combined with other networks"
+# network connect/disconnect on a running container (e2e-web: eth0 on
+# "netker", default route, published port 8080).
+netker network connect e2e-two e2e-web
+out=$(netker exec e2e-web sh -c "ip -o -4 addr show; wget -T 3 -qO- http://$solo_ip/; cat /etc/hosts")
+expect "connect: running container gets eth1" "eth1    inet 10.94." "$out"
+expect "connect: reaches the new network" "solo" "$out"
+expect "connect: /etc/hosts lists the new address" "10.94." "$out"
+if netker network connect e2e-two e2e-web 2>/dev/null; then fail "connecting twice was accepted"; fi
+echo "ok: connect: same network twice is rejected"
+
+netker network disconnect netker e2e-web
+out=$(netker exec e2e-web sh -c "ip -o link show; ip route")
+[[ "$out" != *"eth0"* ]] || fail "disconnect: eth0 still in the container: $out"
+echo "ok: disconnect: eth0 removed from the running container"
+expect "disconnect: default route moved to eth1" "default via 10.94.0.1 dev eth1" "$out"
+expect "disconnect: published port moved to the remaining network" "hello from" "$(curl -s --max-time 3 http://192.0.2.10:8080/)"
+if netker network disconnect netker e2e-web 2>/dev/null; then fail "disconnecting a network twice was accepted"; fi
+echo "ok: disconnect: network not connected is rejected"
+
+netker network connect --ip "$ip" netker e2e-web
+netker network disconnect e2e-two e2e-web
+out=$(netker exec e2e-web ip route)
+expect "reconnect: default route back on eth0" "default via 10.87.0.1 dev eth0" "$out"
+expect "reconnect: same IP reachable again" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
+expect "reconnect: published port follows" "hello from" "$(curl -s --max-time 3 http://192.0.2.10:8080/)"
+
+netker create --name e2e-none --network none alpine true >/dev/null
+if netker network connect e2e-two e2e-none 2>/dev/null; then fail "connect to a --network none container was accepted"; fi
+echo "ok: connect: --network none container is rejected"
+netker rm e2e-none >/dev/null
+
 netker rm -f e2e-solo >/dev/null
 netker network rm e2e-two >/dev/null
 
