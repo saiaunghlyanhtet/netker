@@ -16,7 +16,8 @@ func networkCmd() *cobra.Command {
 		Use:   "network",
 		Short: "Manage networks",
 	}
-	cmd.AddCommand(networkCreateCmd(), networkLsCmd(), networkRmCmd(), networkInspectCmd())
+	cmd.AddCommand(networkCreateCmd(), networkLsCmd(), networkRmCmd(), networkInspectCmd(),
+		networkConnectCmd(), networkDisconnectCmd())
 	return cmd
 }
 
@@ -136,6 +137,48 @@ func networkInspectCmd() *cobra.Command {
 				out = append(out, v)
 			}
 			return printJSON(cmd, out)
+		},
+	}
+}
+
+func networkConnectCmd() *cobra.Command {
+	var ip string
+	cmd := &cobra.Command{
+		Use:   "connect [OPTIONS] NETWORK CONTAINER",
+		Short: "Connect a container to a network",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var addr netip.Addr
+			if ip != "" {
+				var err error
+				if addr, err = netip.ParseAddr(ip); err != nil {
+					return fmt.Errorf("--ip: %w", err)
+				}
+			}
+			m := manager()
+			c, err := m.Get(args[1])
+			if err != nil {
+				return err
+			}
+			return m.Connect(c, args[0], addr)
+		},
+	}
+	cmd.Flags().StringVar(&ip, "ip", "", "IPv4 address on the network")
+	return cmd
+}
+
+func networkDisconnectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "disconnect NETWORK CONTAINER",
+		Short: "Disconnect a container from a network",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			m := manager()
+			c, err := m.Get(args[1])
+			if err != nil {
+				return err
+			}
+			return m.Disconnect(c, args[0])
 		},
 	}
 }
