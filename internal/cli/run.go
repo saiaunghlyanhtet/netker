@@ -16,17 +16,17 @@ import (
 )
 
 type createFlags struct {
-	name, network, ip, entrypoint, workdir, user, hostname string
-	env, publish                                           []string
-	tty, interactive, rm                                   bool
+	name, ip, entrypoint, workdir, user, hostname string
+	env, publish, networks                        []string
+	tty, interactive, rm                          bool
 }
 
 func (f *createFlags) register(cmd *cobra.Command) {
 	fl := cmd.Flags()
 	fl.SetInterspersed(false)
 	fl.StringVar(&f.name, "name", "", "Assign a name to the container")
-	fl.StringVar(&f.network, "network", network.DefaultName, `Network to connect to ("host", "none" or a network name)`)
-	fl.StringVar(&f.ip, "ip", "", "IPv4 address on the network")
+	fl.StringArrayVar(&f.networks, "network", nil, `Network to connect to ("host", "none" or a network name; repeat for more, default "`+network.DefaultName+`")`)
+	fl.StringVar(&f.ip, "ip", "", "IPv4 address on the first network")
 	fl.StringVar(&f.entrypoint, "entrypoint", "", "Overwrite the image's ENTRYPOINT")
 	fl.StringVarP(&f.workdir, "workdir", "w", "", "Working directory inside the container")
 	fl.StringVarP(&f.user, "user", "u", "", "Username or UID (format: <name|uid>[:<group|gid>])")
@@ -50,7 +50,7 @@ func (f *createFlags) options(cmd *cobra.Command, args []string) (container.Crea
 		User:       f.user,
 		Tty:        f.tty,
 		Hostname:   f.hostname,
-		Network:    f.network,
+		Networks:   f.networks,
 		AutoRemove: f.rm,
 		Pull:       cmd.ErrOrStderr(),
 	}

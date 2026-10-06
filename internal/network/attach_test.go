@@ -125,7 +125,7 @@ func TestAttachL3(t *testing.T) {
 	if !ok || !nk.IsPrimary() || nk.Mode != netlink.NETKIT_MODE_L3 {
 		t.Fatalf("host device is not an L3 netkit primary: %#v", host)
 	}
-	if owned, _ := netkit.Owned(); owned[id] == nil {
+	if owned, _ := netkit.Owned(); len(owned[id]) != 1 {
 		t.Fatalf("host device not tagged with owner altname")
 	}
 
@@ -247,5 +247,68 @@ func TestPublishPorts(t *testing.T) {
 	}
 	if _, err := dialIn("", "192.0.2.10:8080"); err == nil {
 		t.Fatal("port still published after UnpublishPorts")
+	}
+}
+
+func TestMultipleNetworks(t *testing.T) {
+	requireNetAdmin(t)
+	s, p := testStore(t)
+	n1, err := s.Get(DefaultName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2 := &Network{Name: "second", Subnet: netip.MustParsePrefix("10.95.0.0/24")}
+	if err := s.Create(n2); err != nil {
+		t.Fatal(err)
+	}
+	a, b := "eeeeeeeeeeeeeeee", "ffffffffffffffff"
+	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
+	epA0, err := s.Attach(n1, a, nsA, 0, netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epA0, a)
+	epA1, err := s.Attach(n2, a, nsA, 1, netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epA1, a)
+	epB, err := s.Attach(n2, b, nsB, 0, netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epB, b)
+
+	if epA1.IfName != "eth1" || !n2.Subnet.Contains(epA1.IP) {
+		t.Fatalf("second attachment: %+v", epA1)
+	}
+	// Traffic to the second network must leave through eth1; the default
+	// route stays on eth0.
+	err = netns.Do(nsA, func() error {
+		for dst, want := range map[string]string{epB.IP.String(): "eth1", "1.1.1.1": "eth0"} {
+			routes, err := netlink.RouteGet(net.ParseIP(dst))
+			if err != nil {
+				return err
+			}
+			l, err := netlink.LinkByIndex(routes[0].LinkIndex)
+			if err != nil {
+				return err
+			}
+			if l.Attrs().Name != want {
+				return fmt.Errorf("route to %s via %s, want %s", dst, l.Attrs().Name, want)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("A->B over the second network: %q, %v", got, err)
+	}
+	if epA1.Datapath == DatapathEBPF && metric(t, s, epA1.HostIfIndex, "forward-local") == 0 {
+		t.Fatal("traffic on eth1 was not forwarded in BPF on the eth1 endpoint")
 	}
 }

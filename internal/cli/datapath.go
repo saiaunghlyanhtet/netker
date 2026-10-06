@@ -145,8 +145,11 @@ func gcCmd() *cobra.Command {
 				return err
 			}
 			devs := 0
-			for id, l := range owned {
-				if !known[id] {
+			for id, links := range owned {
+				if known[id] {
+					continue
+				}
+				for _, l := range links {
 					if err := netkit.Delete(l.Attrs().Name); err == nil {
 						devs++
 					}

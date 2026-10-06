@@ -30,8 +30,10 @@ type CreateOptions struct {
 	User       string
 	Tty        bool
 	Hostname   string
-	Network    string // network name, "host" or "none"; default "netker"
-	IP         netip.Addr
+	// Networks to join, in order (eth0, eth1, ...), or a single "host" or
+	// "none". Default: the "netker" network.
+	Networks   []string
+	IP         netip.Addr // on the first network
 	Ports      []network.PortMapping
 	AutoRemove bool
 	Pull       io.Writer // progress output if the image has to be pulled
@@ -47,6 +49,10 @@ func (m *Manager) Create(o CreateOptions) (c *Container, err error) {
 		return nil, err
 	}
 	args, err := commandLine(img, o)
+	if err != nil {
+		return nil, err
+	}
+	networks, err := validateNetworks(o.Networks)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +91,8 @@ func (m *Manager) Create(o CreateOptions) (c *Container, err error) {
 		User:        firstNonEmpty(o.User, img.Config.User),
 		Tty:         o.Tty,
 		Hostname:    firstNonEmpty(o.Hostname, idutil.Short(id)),
-		Network:     firstNonEmpty(o.Network, network.DefaultName),
+		Network:     networks[0],
+		Networks:    networks,
 		Ports:       o.Ports,
 		AutoRemove:  o.AutoRemove,
 	}
@@ -119,6 +126,28 @@ func (m *Manager) Create(o CreateOptions) (c *Container, err error) {
 		return c, err
 	}
 	return c, m.save(c)
+}
+
+// validateNetworks applies the default and rejects combinations Docker
+// rejects too: "host" or "none" with anything else, or a network twice.
+func validateNetworks(nets []string) ([]string, error) {
+	if len(nets) == 0 {
+		return []string{network.DefaultName}, nil
+	}
+	if len(nets) > 10 {
+		return nil, fmt.Errorf("at most 10 networks per container")
+	}
+	seen := map[string]bool{}
+	for _, n := range nets {
+		if (n == network.ModeHost || n == network.ModeNone) && len(nets) > 1 {
+			return nil, fmt.Errorf("--network %s can't be combined with other networks", n)
+		}
+		if seen[n] {
+			return nil, fmt.Errorf("network %s given more than once", n)
+		}
+		seen[n] = true
+	}
+	return nets, nil
 }
 
 func commandLine(img *image.Image, o CreateOptions) ([]string, error) {
@@ -227,19 +256,27 @@ func (m *Manager) setupNetwork(c *Container, ip netip.Addr) error {
 	if c.Network == network.ModeNone {
 		return netns.Do(c.NetNSPath, netns.LoopbackUp)
 	}
-	n, err := m.Networks.Get(c.Network)
-	if err != nil {
-		return err
+	for idx, name := range c.Networks {
+		n, err := m.Networks.Get(name)
+		if err != nil {
+			return err
+		}
+		want := netip.Addr{}
+		if idx == 0 {
+			want = ip
+		}
+		ep, err := m.Networks.Attach(n, c.ID, c.NetNSPath, idx, want)
+		if err != nil {
+			return err
+		}
+		c.Endpoints = append(c.Endpoints, ep)
+		// Saved after each attachment so teardown finds it if a later one fails.
+		if err := m.save(c); err != nil {
+			return err
+		}
 	}
-	ep, err := m.Networks.Attach(n, c.ID, c.NetNSPath, 0, ip)
-	if err != nil {
-		return err
-	}
-	c.Endpoints = append(c.Endpoints, ep)
-	if err := m.save(c); err != nil {
-		return err
-	}
-	return m.Networks.Publish(c.ID, ep, c.Ports)
+	// Published ports go to the first network's address, like Docker.
+	return m.Networks.Publish(c.ID, c.Endpoints[0], c.Ports)
 }
 
 func (m *Manager) writeEtcFiles(c *Container) error {

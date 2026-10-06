@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 	vnetns "github.com/vishvananda/netns"
@@ -30,13 +32,32 @@ func ParseMode(s string) (Mode, error) {
 	return "", fmt.Errorf("unknown netkit mode %q (want l3 or l2)", s)
 }
 
-// OwnerAltName tags the primary device so netker can find the pairs it owns,
-// e.g. during garbage collection after a crash.
-func OwnerAltName(containerID string) string { return "netker-" + containerID }
+// OwnerAltName tags a container's primary device for attachment idx so
+// netker can find the pairs it owns, e.g. during garbage collection after a
+// crash. Altnames are unique per netns, hence one per attachment.
+func OwnerAltName(containerID string, idx int) string {
+	return fmt.Sprintf("netker-%s-%d", containerID, idx)
+}
+
+// ownerOf returns the container ID in an altname written by OwnerAltName,
+// or by netker versions that tagged only one device as "netker-<id>".
+func ownerOf(alt string) (string, bool) {
+	rest, ok := strings.CutPrefix(alt, "netker-")
+	if !ok || rest == "" {
+		return "", false
+	}
+	if i := strings.LastIndexByte(rest, '-'); i > 0 {
+		if _, err := strconv.Atoi(rest[i+1:]); err == nil {
+			return rest[:i], true
+		}
+	}
+	return rest, true
+}
 
 // PairSpec describes one container attachment.
 type PairSpec struct {
 	ContainerID string
+	Index       int    // attachment number: eth<Index> in the container
 	HostName    string // primary device, stays in the host netns (<= 15 chars)
 	PeerName    string // final interface name inside the container, e.g. eth0
 	NetNSPath   string // container network namespace
@@ -101,7 +122,7 @@ func CreatePair(spec PairSpec) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := netlink.LinkAddAltName(host, OwnerAltName(spec.ContainerID)); err != nil {
+	if err := netlink.LinkAddAltName(host, OwnerAltName(spec.ContainerID, spec.Index)); err != nil {
 		return fmt.Errorf("tag %s: %w", spec.HostName, err)
 	}
 
@@ -143,22 +164,21 @@ func Delete(hostName string) error {
 	return netlink.LinkDel(l)
 }
 
-// Owned lists the host-side netkit devices tagged with OwnerAltName, keyed by
+// Owned lists the host-side netkit devices tagged by OwnerAltName, keyed by
 // container ID.
-func Owned() (map[string]netlink.Link, error) {
+func Owned() (map[string][]netlink.Link, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]netlink.Link{}
+	out := map[string][]netlink.Link{}
 	for _, l := range links {
 		if l.Type() != "netkit" {
 			continue
 		}
 		for _, alt := range l.Attrs().AltNames {
-			const p = "netker-"
-			if len(alt) > len(p) && alt[:len(p)] == p {
-				out[alt[len(p):]] = l
+			if id, ok := ownerOf(alt); ok {
+				out[id] = append(out[id], l)
 			}
 		}
 	}
