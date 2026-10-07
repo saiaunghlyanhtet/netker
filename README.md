@@ -91,7 +91,12 @@ go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
 - Legacy datapath: published ports aren't reachable through `127.0.0.1`.
 - There is no shim yet, so exit codes of detached containers aren't recorded, and
   `--rm` only works for foreground runs.
-- No seccomp profile, resource limits, or container name DNS yet.
+- No seccomp profile or resource limits yet.
+- Container names resolve through `/etc/hosts`, not a DNS server: containers on
+  a shared network see each other by name, hostname and short ID, and the files
+  are rewritten when containers join or leave. Unlike Docker's DNS, stopped
+  containers stay listed (they keep their addresses), and names don't resolve
+  for tools that skip `/etc/hosts` (e.g. `dig`).
 
 ## License
 

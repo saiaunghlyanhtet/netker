@@ -50,7 +50,7 @@ func (m *Manager) Connect(c *Container, name string, ip netip.Addr) error {
 			return err
 		}
 	}
-	return m.writeEtcFiles(c)
+	return m.refreshHosts([]string{name})
 }
 
 // Disconnect removes a container from a network. If that attachment carried
@@ -91,7 +91,8 @@ func (m *Manager) Disconnect(c *Container, name string) error {
 			errs = append(errs, m.Networks.Publish(c.ID, c.Endpoints[0], c.Ports))
 		}
 	}
-	errs = append(errs, m.save(c), m.writeEtcFiles(c))
+	// The network's members forget this container, and it forgets them.
+	errs = append(errs, m.save(c), m.refreshHosts([]string{name}, c))
 	return errors.Join(errs...)
 }
 

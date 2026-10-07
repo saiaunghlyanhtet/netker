@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer >/dev/null 2>&1 || true
 	netker network rm e2e-two >/dev/null 2>&1 || true
 	netker network rm e2e-l2 >/dev/null 2>&1 || true
 	ip link del e2e-pub0 2>/dev/null || true
@@ -37,6 +37,12 @@ expect "container side is eth0 in L3 mode" "NOARP" "$(netker exec e2e-web ip lin
 
 expect "host -> container" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
 expect "container -> container" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- "http://$ip/")"
+expect "names: a new container reaches e2e-web by name" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- http://e2e-web/)"
+netker run -d --name e2e-peer alpine sleep 300 >/dev/null
+expect "names: a running container learns a peer started later" "e2e-peer" "$(netker exec e2e-web cat /etc/hosts)"
+netker rm -f e2e-peer >/dev/null
+if netker exec e2e-web cat /etc/hosts | grep -q e2e-peer; then fail "names: removed peer still in /etc/hosts"; fi
+echo "ok: names: a removed peer disappears from /etc/hosts"
 
 datapath=$(netker inspect e2e-web | sed -n 's/.*"datapath": "\(.*\)".*/\1/p' | head -1)
 echo "datapath: $datapath"
@@ -104,6 +110,8 @@ out=$(netker exec e2e-web sh -c "ip -o -4 addr show; wget -T 3 -qO- http://$solo
 expect "connect: running container gets eth1" "eth1    inet 10.94." "$out"
 expect "connect: reaches the new network" "solo" "$out"
 expect "connect: /etc/hosts lists the new address" "10.94." "$out"
+expect "names: connect makes the new network's containers resolvable" "e2e-solo" "$out"
+expect "names: and the new network's containers learn this one" "e2e-web" "$(netker exec e2e-solo cat /etc/hosts)"
 if netker network connect e2e-two e2e-web 2>/dev/null; then fail "connecting twice was accepted"; fi
 echo "ok: connect: same network twice is rejected"
 
@@ -118,6 +126,10 @@ echo "ok: disconnect: network not connected is rejected"
 
 netker network connect --ip "$ip" netker e2e-web
 netker network disconnect e2e-two e2e-web
+if netker exec e2e-solo cat /etc/hosts | grep -q e2e-web || netker exec e2e-web cat /etc/hosts | grep -q e2e-solo; then
+	fail "names: still listed after disconnect"
+fi
+echo "ok: names: disconnect removes the names on both sides"
 out=$(netker exec e2e-web ip route)
 expect "reconnect: default route back on eth0" "default via 10.87.0.1 dev eth0" "$out"
 expect "reconnect: same IP reachable again" "hello from" "$(curl -s --max-time 3 "http://$ip/")"

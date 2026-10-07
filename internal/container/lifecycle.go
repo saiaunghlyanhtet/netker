@@ -125,7 +125,12 @@ func (m *Manager) Create(o CreateOptions) (c *Container, err error) {
 	if err := m.writeSpec(c, img); err != nil {
 		return c, err
 	}
-	return c, m.save(c)
+	if err := m.save(c); err != nil {
+		return c, err
+	}
+	// This container and the ones it shares networks with learn each
+	// other's names.
+	return c, m.refreshHosts(c.Networks)
 }
 
 // validateNetworks applies the default and rejects combinations Docker
@@ -279,14 +284,11 @@ func (m *Manager) setupNetwork(c *Container, ip netip.Addr) error {
 	return m.Networks.Publish(c.ID, c.Endpoints[0], c.Ports)
 }
 
+// writeEtcFiles writes the hostname and resolv.conf files and an initial
+// /etc/hosts; refreshHosts fills in the other containers.
 func (m *Manager) writeEtcFiles(c *Container) error {
 	dir := m.dir(c.ID)
-	var hosts strings.Builder
-	hosts.WriteString("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
-	for _, ep := range c.Endpoints {
-		fmt.Fprintf(&hosts, "%s\t%s %s\n", ep.IP, c.Hostname, c.Name)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "hosts"), []byte(hosts.String()), 0o644); err != nil {
+	if err := m.writeHosts(c, nil); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "hostname"), []byte(c.Hostname+"\n"), 0o644); err != nil {
@@ -477,7 +479,11 @@ func (m *Manager) teardown(c *Container) error {
 		// Keep the record so the user can retry.
 		return errors.Join(errs...)
 	}
-	return removeAll(m.dir(c.ID))
+	if err := removeAll(m.dir(c.ID)); err != nil {
+		return err
+	}
+	// The record is gone, so the rewrite drops this container's names.
+	return m.refreshHosts(c.Networks)
 }
 
 // removeAll is os.RemoveAll that also handles read-only directories left

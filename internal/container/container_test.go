@@ -1,8 +1,10 @@
 package container
 
 import (
+	"net/netip"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/saiaunghlyanhtet/netker/internal/config"
@@ -77,5 +79,37 @@ func TestLoadBackfillsDefaultRoute(t *testing.T) {
 	}
 	if !reflect.DeepEqual(c.Networks, []string{"a"}) {
 		t.Fatalf("networks %v", c.Networks)
+	}
+}
+
+func TestHostsFile(t *testing.T) {
+	ep := func(net, ip, ifname string) *network.Endpoint {
+		return &network.Endpoint{Network: net, IP: netip.MustParseAddr(ip), IfName: ifname}
+	}
+	web := &Container{ID: "aaaaaaaaaaaa1111", Name: "web", Hostname: "aaaaaaaaaaaa",
+		Endpoints: []*network.Endpoint{ep("front", "10.1.0.2", "eth0"), ep("back", "10.2.0.2", "eth1")}}
+	db := &Container{ID: "bbbbbbbbbbbb2222", Name: "db", Hostname: "dbhost",
+		Endpoints: []*network.Endpoint{ep("back", "10.2.0.3", "eth0")}}
+	lb := &Container{ID: "cccccccccccc3333", Name: "lb", Hostname: "cccccccccccc",
+		Endpoints: []*network.Endpoint{ep("front", "10.1.0.4", "eth0")}}
+	other := &Container{ID: "dddddddddddd4444", Name: "other", Hostname: "dddddddddddd",
+		Endpoints: []*network.Endpoint{ep("elsewhere", "10.9.0.2", "eth0")}}
+	all := []*Container{web, db, lb, other}
+
+	got := string(hostsFile(web, all))
+	want := "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n" +
+		"10.1.0.2\tweb aaaaaaaaaaaa\n" +
+		"10.2.0.2\tweb aaaaaaaaaaaa\n" +
+		"10.2.0.3\tdb dbhost bbbbbbbbbbbb\n" +
+		"10.1.0.4\tlb cccccccccccc\n"
+	if got != want {
+		t.Fatalf("web's hosts:\n%s\nwant:\n%s", got, want)
+	}
+	// db only shares "back" with web, so it sees web's back address only.
+	if got := string(hostsFile(db, all)); !strings.Contains(got, "10.2.0.2\tweb") || strings.Contains(got, "10.1.0.2") || strings.Contains(got, "lb") {
+		t.Fatalf("db's hosts:\n%s", got)
+	}
+	if got := string(hostsFile(other, all)); strings.Contains(got, "web") || strings.Contains(got, "db") {
+		t.Fatalf("a container on another network was listed:\n%s", got)
 	}
 }
