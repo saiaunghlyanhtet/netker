@@ -57,7 +57,7 @@ static __always_inline bool parse_l4(struct __sk_buff *skb, struct iphdr *ip, st
 		l->csum_off = l->off + __builtin_offsetof(struct icmp_echo, checksum);
 		return true;
 	}
-	git add -A && git commit -F .git/NETKER_M3_COMMIT_MSG}
+	}
 	return false;
 }
 
