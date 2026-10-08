@@ -4,6 +4,7 @@
 #include "common.h"
 
 #define EP_F_INTERNAL 0x1 /* network has no external connectivity */
+#define EP_F_NO_ICC 0x2   /* no traffic between containers of the network */
 
 struct endpoint {
 	__u32 ifindex;      /* primary, host netns */

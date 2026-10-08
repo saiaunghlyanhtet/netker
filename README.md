@@ -35,6 +35,7 @@ sudo bin/netker run --rm --network lab alpine ip link
 sudo bin/netker run --rm --network netker --network lab alpine ip -4 addr   # eth0 + eth1
 sudo bin/netker network connect lab web       # hot-plug eth1 into a running container
 sudo bin/netker network disconnect lab web
+sudo bin/netker network create --subnet 10.98.0.0/24 --icc=false isolated   # no container-to-container traffic
 
 sudo bin/netker rm -f web
 ```

@@ -9,8 +9,8 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer >/dev/null 2>&1 || true
-	netker network rm e2e-two >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 >/dev/null 2>&1 || true
+	netker network rm e2e-two e2e-iso >/dev/null 2>&1 || true
 	netker network rm e2e-l2 >/dev/null 2>&1 || true
 	ip link del e2e-pub0 2>/dev/null || true
 }
@@ -90,6 +90,22 @@ netker network create --subnet 10.99.0.0/24 --netkit-mode l2 e2e-l2 >/dev/null
 out=$(netker run --rm --network e2e-l2 alpine sh -c 'ip link show eth0; ping -c1 -W2 10.99.0.1')
 expect "L2 network: ARP enabled on eth0" "02:" "$out"
 expect "L2 network: gateway reachable" "1 packets received" "$out"
+
+# --icc=false: containers on the network can't reach each other, but can
+# reach published ports and the host.
+netker network create --subnet 10.91.0.0/24 --icc=false e2e-iso >/dev/null
+expect "icc: network ls shows ICC off" "false" "$(netker network ls | grep e2e-iso | awk '{print $NF}')"
+netker run -d --name e2e-iso1 --network e2e-iso alpine sh -c \
+	'while true; do printf "HTTP/1.0 200 OK\r\n\r\niso\n" | nc -l -p 80; done' >/dev/null
+sleep 0.5
+iso1_ip=$(netker inspect e2e-iso1 | sed -n 's/.*"ip": "\(.*\)".*/\1/p' | head -1)
+if netker run --rm --network e2e-iso alpine wget -T 2 -qO- "http://$iso1_ip/" >/dev/null 2>&1; then
+	fail "icc: containers on an --icc=false network reached each other"
+fi
+echo "ok: icc: container-to-container blocked"
+expect "icc: published ports stay reachable" "hello from" "$(netker run --rm --network e2e-iso alpine wget -T 3 -qO- http://192.0.2.10:8080/)"
+netker rm -f e2e-iso1 >/dev/null
+netker network rm e2e-iso >/dev/null
 
 netker network create --subnet 10.94.0.0/24 e2e-two >/dev/null
 netker run -d --name e2e-solo --network e2e-two alpine sh -c \

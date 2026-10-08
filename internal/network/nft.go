@@ -109,6 +109,10 @@ func ensureNetworkRules(n *Network) error {
 	} else {
 		fmt.Fprintf(&b, "add rule ip netker postrouting ip saddr %s ip daddr != %s masquerade comment %q\n", n.Subnet, n.Subnet, c)
 	}
+	if n.NoICC {
+		// Published ports were DNATed and stay reachable, as in BPF.
+		fmt.Fprintf(&b, "add rule ip netker forward ip saddr %s ip daddr %s ct status != dnat drop comment %q\n", n.Subnet, n.Subnet, c)
+	}
 	return nft(b.String())
 }
 

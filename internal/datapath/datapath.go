@@ -25,12 +25,16 @@ type Endpoint struct {
 	PeerIfIndex int // ifindex inside the container netns
 	NetID       uint32
 	Internal    bool // network without external connectivity
+	NoICC       bool // no traffic between containers of the network
 	HostMAC     net.HardwareAddr
 	PeerMAC     net.HardwareAddr
 }
 
 // Endpoint flags, EP_F_* in bpf/lib/maps.h.
-const flagInternal = 0x1
+const (
+	flagInternal = 0x1
+	flagNoICC    = 0x2
+)
 
 // NetID derives a network's numeric ID from its name.
 func NetID(network string) uint32 { return crc32.ChecksumIEEE([]byte(network)) }
@@ -90,6 +94,9 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	}
 	if ep.Internal {
 		val.Flags |= flagInternal
+	}
+	if ep.NoICC {
+		val.Flags |= flagNoICC
 	}
 	copy(val.Mac[:], ep.HostMAC)
 	copy(val.PeerMac[:], ep.PeerMAC)
@@ -369,7 +376,7 @@ var Reasons = map[uint8]string{
 	1: "forward-local", 2: "pass-stack", 3: "pass-arp", 4: "deliver",
 	5: "snat", 6: "rev-snat", 7: "dnat", 8: "rev-dnat",
 	10: "drop-spoof", 11: "drop-policy", 12: "drop-not-ours", 13: "drop-proto", 14: "drop-malformed",
-	15: "drop-nat-exhausted", 16: "drop-mcast",
+	15: "drop-nat-exhausted", 16: "drop-mcast", 17: "drop-icc",
 }
 
 type Metric struct {

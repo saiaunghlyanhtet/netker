@@ -23,14 +23,14 @@ func networkCmd() *cobra.Command {
 
 func networkCreateCmd() *cobra.Command {
 	var subnet, gateway, mode string
-	var internal bool
+	var internal, icc bool
 	var mtu int
 	cmd := &cobra.Command{
 		Use:   "create [OPTIONS] NETWORK",
 		Short: "Create a network",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			n := &network.Network{Name: args[0], Internal: internal, MTU: mtu}
+			n := &network.Network{Name: args[0], Internal: internal, NoICC: !icc, MTU: mtu}
 			var err error
 			if n.Subnet, err = netip.ParsePrefix(subnet); err != nil {
 				return fmt.Errorf("--subnet: %w", err)
@@ -55,6 +55,7 @@ func networkCreateCmd() *cobra.Command {
 	fl.StringVar(&gateway, "gateway", "", "Gateway address (default: first address of the subnet)")
 	fl.StringVar(&mode, "netkit-mode", "l3", "netkit device mode: l3 (no ARP) or l2")
 	fl.BoolVar(&internal, "internal", false, "Restrict external access to the network")
+	fl.BoolVar(&icc, "icc", true, "Allow traffic between containers of the network (--icc=false blocks it)")
 	fl.IntVar(&mtu, "mtu", 0, "MTU of the netkit devices")
 	cmd.MarkFlagRequired("subnet")
 	return cmd
@@ -72,9 +73,9 @@ func networkLsCmd() *cobra.Command {
 				return err
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 3, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tSUBNET\tGATEWAY\tNETKIT MODE\tINTERNAL")
+			fmt.Fprintln(tw, "NAME\tSUBNET\tGATEWAY\tNETKIT MODE\tINTERNAL\tICC")
 			for _, n := range nets {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\n", n.Name, n.Subnet, n.Gateway, n.Mode, n.Internal)
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%v\n", n.Name, n.Subnet, n.Gateway, n.Mode, n.Internal, !n.NoICC)
 			}
 			return tw.Flush()
 		},
