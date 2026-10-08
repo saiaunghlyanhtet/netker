@@ -52,6 +52,7 @@ enum reason {
 	REASON_DROP_MALFORMED = 14,
 	REASON_DROP_NAT_EXHAUSTED = 15,
 	REASON_DROP_MCAST = 16,   /* multicast/broadcast sent towards a container */
+	REASON_DROP_ICC = 17,     /* container to container on an --icc=false network */
 };
 
 enum direction {

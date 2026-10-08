@@ -385,3 +385,38 @@ func TestHotplugAndDefaultRouteMove(t *testing.T) {
 		t.Fatalf("eth1 -> gateway: %q, %v", got, err)
 	}
 }
+
+// TestNoICC runs on whichever datapath is available: nftables when
+// unprivileged, BPF as root.
+func TestNoICC(t *testing.T) {
+	requireNetAdmin(t)
+	s, p := testStore(t)
+	n := &Network{Name: "noicc", Subnet: netip.MustParsePrefix("10.92.0.0/24"), NoICC: true}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	a, b := "1313131313131313", "1414141414141414"
+	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
+	epA, err := s.Attach(n, a, nsA, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epA, a)
+	epB, err := s.Attach(n, b, nsB, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epB, b)
+
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	if _, err := dialIn(nsA, epB.IP.String()+":9000"); err == nil {
+		t.Fatal("containers on an --icc=false network reached each other")
+	}
+	listenIn(t, "", epA.Gateway.String()+":8086")
+	if got, err := dialIn(nsA, epA.Gateway.String()+":8086"); err != nil || got != "hello from netker" {
+		t.Fatalf("container -> gateway on an --icc=false network: %q, %v", got, err)
+	}
+	if epA.Datapath == DatapathEBPF && metric(t, s, epA.HostIfIndex, "drop-icc") == 0 {
+		t.Fatal("blocked traffic not counted as drop-icc")
+	}
+}

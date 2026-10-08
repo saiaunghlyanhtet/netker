@@ -93,6 +93,7 @@ int nk_from_container(struct __sk_buff *skb)
 	}
 	__u32 src_netid = src->netid;
 	bool internal = src->flags & EP_F_INTERNAL;
+	bool no_icc = src->flags & EP_F_NO_ICC;
 	bool has_l4 = parse_l4(skb, ip, &l);
 	bool rev_dnat = false;
 
@@ -126,6 +127,14 @@ int nk_from_container(struct __sk_buff *skb)
 		 */
 		if (!rev_dnat && dst->netid != src_netid) {
 			count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+			return NETKIT_DROP;
+		}
+		/* --icc=false: no direct traffic between the network's
+		 * containers. Published ports (hairpin, below) and their
+		 * replies stay reachable, as they were exposed on purpose.
+		 */
+		if (!rev_dnat && no_icc) {
+			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
 			return NETKIT_DROP;
 		}
 		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL);

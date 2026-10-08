@@ -490,3 +490,32 @@ func TestEBPFInternalNetwork(t *testing.T) {
 		t.Fatal("internal container reachable from the world through a published port")
 	}
 }
+
+func TestEBPFNoICCKeepsPublishedPorts(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n := &Network{Name: "noicc", Subnet: netip.MustParsePrefix("10.92.0.0/24"), NoICC: true}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	epA, nsA := attachT(t, s, n, "a0a0a0a0a0a0a0a0")
+	epB, nsB := attachT(t, s, n, "b0b0b0b0b0b0b0b0")
+	listenIn(t, nsB, epB.IP.String()+":80")
+	if err := s.Publish("b0b0b0b0b0b0b0b0", epB, []PortMapping{{HostPort: 8082, ContainerPort: 80, Protocol: "tcp"}}); err != nil {
+		t.Fatal(err)
+	}
+	dropNFT(t)
+	if _, err := dialIn(nsA, epB.IP.String()+":80"); err == nil {
+		t.Fatal("direct container-to-container traffic allowed with --icc=false")
+	}
+	if metric(t, s, epA.HostIfIndex, "drop-icc") == 0 {
+		t.Fatal("not counted as drop-icc")
+	}
+	if got, err := dialIn(nsA, w.hostIP.String()+":8082"); err != nil || got != "hello from netker" {
+		t.Fatalf("hairpin to a published port with --icc=false: %q, %v", got, err)
+	}
+	listenRemoteIn(t, w.ns, w.peerIP.String()+":7000")
+	if _, err := dialIn(nsA, w.peerIP.String()+":7000"); err != nil {
+		t.Fatalf("container -> world with --icc=false: %v", err)
+	}
+}

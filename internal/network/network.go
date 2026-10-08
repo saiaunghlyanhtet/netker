@@ -43,6 +43,8 @@ type Network struct {
 	Mode     netkit.Mode  `json:"netkit_mode"`
 	MTU      int          `json:"mtu"`
 	Internal bool         `json:"internal"`
+	// NoICC blocks traffic between the network's containers (--icc=false).
+	NoICC bool `json:"no_icc,omitempty"`
 }
 
 type Store struct {
