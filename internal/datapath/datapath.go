@@ -26,6 +26,7 @@ type Endpoint struct {
 	NetID       uint32
 	Internal    bool // network without external connectivity
 	NoICC       bool // no traffic between containers of the network
+	L2          bool // netkit L2 mode: enforce the container's MAC
 	HostMAC     net.HardwareAddr
 	PeerMAC     net.HardwareAddr
 }
@@ -34,6 +35,7 @@ type Endpoint struct {
 const (
 	flagInternal = 0x1
 	flagNoICC    = 0x2
+	flagL2       = 0x4
 )
 
 // NetID derives a network's numeric ID from its name.
@@ -97,6 +99,9 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	}
 	if ep.NoICC {
 		val.Flags |= flagNoICC
+	}
+	if ep.L2 {
+		val.Flags |= flagL2
 	}
 	copy(val.Mac[:], ep.HostMAC)
 	copy(val.PeerMac[:], ep.PeerMAC)
@@ -376,7 +381,7 @@ var Reasons = map[uint8]string{
 	1: "forward-local", 2: "pass-stack", 3: "pass-arp", 4: "deliver",
 	5: "snat", 6: "rev-snat", 7: "dnat", 8: "rev-dnat",
 	10: "drop-spoof", 11: "drop-policy", 12: "drop-not-ours", 13: "drop-proto", 14: "drop-malformed",
-	15: "drop-nat-exhausted", 16: "drop-mcast", 17: "drop-icc",
+	15: "drop-nat-exhausted", 16: "drop-mcast", 17: "drop-icc", 18: "drop-spoof-mac",
 }
 
 type Metric struct {

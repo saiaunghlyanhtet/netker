@@ -5,6 +5,7 @@
 
 #define EP_F_INTERNAL 0x1 /* network has no external connectivity */
 #define EP_F_NO_ICC 0x2   /* no traffic between containers of the network */
+#define EP_F_L2 0x4       /* netkit L2 mode: frames carry the container's MAC */
 
 struct endpoint {
 	__u32 ifindex;      /* primary, host netns */

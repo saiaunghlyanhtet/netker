@@ -53,6 +53,7 @@ enum reason {
 	REASON_DROP_NAT_EXHAUSTED = 15,
 	REASON_DROP_MCAST = 16,   /* multicast/broadcast sent towards a container */
 	REASON_DROP_ICC = 17,     /* container to container on an --icc=false network */
+	REASON_DROP_SPOOF_MAC = 18, /* L2: source MAC isn't the container's */
 };
 
 enum direction {

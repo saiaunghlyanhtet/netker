@@ -58,6 +58,54 @@ static __always_inline int to_local(struct __sk_buff *skb, __u32 self, struct en
 	return bpf_redirect(dst_ifindex, 0);
 }
 
+static __always_inline bool mac_eq(const __u8 *a, const __u8 *b)
+{
+	for (int i = 0; i < 6; i++)
+		if (a[i] != b[i])
+			return false;
+	return true;
+}
+
+/* Ethernet/IPv4 ARP payload. */
+struct arp_eth {
+	__be16 htype;
+	__be16 ptype;
+	__u8 hlen;
+	__u8 plen;
+	__be16 op;
+	__u8 sha[6];
+	__be32 sip;
+	__u8 tha[6];
+	__be32 tip;
+} __attribute__((packed));
+
+/* from_container_arp lets a container's ARP through only if it speaks for
+ * its own address, and on L2 networks with its own MAC; otherwise it could
+ * poison the host's ARP cache with another container's IP.
+ */
+static __always_inline int from_container_arp(struct __sk_buff *skb, struct ethhdr *eth, __u32 self)
+{
+	struct arp_eth arp;
+
+	if (bpf_skb_load_bytes(skb, ETH_HLEN, &arp, sizeof(arp)) < 0) {
+		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		return NETKIT_DROP;
+	}
+	__be32 sip = arp.sip;
+	struct endpoint *ep = bpf_map_lookup_elem(&netker_endpoints, &sip);
+	if (!ep || ep->ifindex != self) {
+		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		return NETKIT_DROP;
+	}
+	if ((ep->flags & EP_F_L2) &&
+	    (!mac_eq(arp.sha, ep->peer_mac) || !mac_eq(eth->h_source, ep->peer_mac))) {
+		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
+		return NETKIT_DROP;
+	}
+	count(self, DIR_EGRESS, REASON_PASS_ARP, skb->len);
+	return NETKIT_PASS;
+}
+
 SEC("netkit/peer")
 int nk_from_container(struct __sk_buff *skb)
 {
@@ -71,10 +119,8 @@ int nk_from_container(struct __sk_buff *skb)
 		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
 		return NETKIT_DROP;
 	}
-	if (eth->h_proto == bpf_htons(ETH_P_ARP)) {
-		count(self, DIR_EGRESS, REASON_PASS_ARP, skb->len);
-		return NETKIT_PASS;
-	}
+	if (eth->h_proto == bpf_htons(ETH_P_ARP))
+		return from_container_arp(skb, eth, self);
 	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 		count(self, DIR_EGRESS, REASON_DROP_PROTO, skb->len);
 		return NETKIT_DROP;
@@ -89,6 +135,13 @@ int nk_from_container(struct __sk_buff *skb)
 	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints, &saddr);
 	if (!src || src->ifindex != self) {
 		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		return NETKIT_DROP;
+	}
+	/* On L2 networks the container could change its MAC (netkit allows
+	 * live address changes); only its recorded MAC may send.
+	 */
+	if ((src->flags & EP_F_L2) && !mac_eq(eth->h_source, src->peer_mac)) {
+		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
 		return NETKIT_DROP;
 	}
 	__u32 src_netid = src->netid;

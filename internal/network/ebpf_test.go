@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -13,6 +14,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
@@ -518,4 +520,113 @@ func TestEBPFNoICCKeepsPublishedPorts(t *testing.T) {
 	if _, err := dialIn(nsA, w.peerIP.String()+":7000"); err != nil {
 		t.Fatalf("container -> world with --icc=false: %v", err)
 	}
+}
+
+// sendARP sends one ARP reply out of eth0 in the namespace at ns, with the
+// given Ethernet source and ARP sender fields, to the host's primary.
+func sendARP(t *testing.T, ns string, ethSrc, sha net.HardwareAddr, sip netip.Addr, hostMAC net.HardwareAddr, tip netip.Addr) {
+	t.Helper()
+	err := netns.Do(ns, func() error {
+		l, err := netlink.LinkByName("eth0")
+		if err != nil {
+			return err
+		}
+		proto := uint16(unix.ETH_P_ARP<<8&0xff00 | unix.ETH_P_ARP>>8)
+		fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(proto))
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		frame := make([]byte, 0, 42)
+		frame = append(frame, hostMAC...)
+		frame = append(frame, ethSrc...)
+		frame = append(frame, 0x08, 0x06)                   // ETH_P_ARP
+		frame = append(frame, 0, 1, 0x08, 0x00, 6, 4, 0, 2) // Ethernet/IPv4, reply
+		frame = append(frame, sha...)
+		frame = append(frame, sip.AsSlice()...)
+		frame = append(frame, hostMAC...)
+		frame = append(frame, tip.AsSlice()...)
+		sa := &unix.SockaddrLinklayer{Ifindex: l.Attrs().Index, Protocol: proto, Halen: 6}
+		copy(sa.Addr[:], hostMAC)
+		err = unix.Sendto(fd, frame, 0, sa)
+		// A frame the BPF program drops comes back as NET_XMIT_DROP from
+		// netkit_xmit, which packet sockets report as ENOBUFS.
+		if errors.Is(err, unix.ENOBUFS) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEBPFL2AntiSpoofing(t *testing.T) {
+	s, _ := ebpfStore(t)
+	n := &Network{Name: "l2guard", Subnet: netip.MustParsePrefix("10.90.0.0/24"), Mode: netkit.ModeL2}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	a, b := "c1c1c1c1c1c1c1c1", "d1d1d1d1d1d1d1d1"
+	epA, nsA := attachT(t, s, n, a)
+	epB, nsB := attachT(t, s, n, b)
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	realMAC := deterministicMAC(a, 0, 1)
+	hostMAC := deterministicMAC(a, 0, 0)
+	fake, _ := net.ParseMAC("02:de:ad:be:ef:01")
+
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("baseline A->B on L2: %q, %v", got, err)
+	}
+
+	setMAC := func(mac net.HardwareAddr) {
+		t.Helper()
+		err := netns.Do(nsA, func() error {
+			l, err := netlink.LinkByName("eth0")
+			if err != nil {
+				return err
+			}
+			return netlink.LinkSetHardwareAddr(l, mac)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("changed MAC is dropped", func(t *testing.T) {
+		setMAC(fake)
+		dialIn(nsA, epB.IP.String()+":9000")
+		if metric(t, s, epA.HostIfIndex, "drop-spoof-mac") == 0 {
+			dumpMetrics(t, s)
+			t.Fatal("frames from a changed MAC were not dropped as drop-spoof-mac")
+		}
+		setMAC(realMAC)
+		if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+			t.Fatalf("after restoring the MAC: %q, %v", got, err)
+		}
+	})
+	t.Run("ARP for another container's IP is dropped", func(t *testing.T) {
+		before := metric(t, s, epA.HostIfIndex, "drop-spoof")
+		sendARP(t, nsA, realMAC, realMAC, epB.IP, hostMAC, epA.Gateway)
+		time.Sleep(100 * time.Millisecond)
+		if metric(t, s, epA.HostIfIndex, "drop-spoof") == before {
+			t.Fatal("ARP claiming B's IP was not dropped")
+		}
+		neighs, err := netlink.NeighList(epA.HostIfIndex, netlink.FAMILY_V4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, nb := range neighs {
+			if nb.IP.Equal(net.IP(epB.IP.AsSlice())) {
+				t.Fatalf("host learned B's IP on A's device: %v", nb)
+			}
+		}
+	})
+	t.Run("ARP with a fake sender MAC is dropped", func(t *testing.T) {
+		before := metric(t, s, epA.HostIfIndex, "drop-spoof-mac")
+		sendARP(t, nsA, realMAC, fake, epA.IP, hostMAC, epA.Gateway)
+		time.Sleep(100 * time.Millisecond)
+		if metric(t, s, epA.HostIfIndex, "drop-spoof-mac") == before {
+			t.Fatal("ARP with a fake sender MAC was not dropped")
+		}
+	})
 }
