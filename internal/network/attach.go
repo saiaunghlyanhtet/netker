@@ -139,6 +139,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 			NetID:       datapath.NetID(n.Name),
 			Internal:    n.Internal,
 			NoICC:       n.NoICC,
+			L2:          n.Mode == netkit.ModeL2,
 			HostMAC:     host.Attrs().HardwareAddr,
 			PeerMAC:     peer.Attrs().HardwareAddr,
 		})
