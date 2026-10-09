@@ -22,7 +22,8 @@ func networkCmd() *cobra.Command {
 }
 
 func networkCreateCmd() *cobra.Command {
-	var subnet, gateway, mode string
+	var subnets, gateways []string
+	var mode string
 	var internal, icc bool
 	var mtu int
 	cmd := &cobra.Command{
@@ -32,12 +33,30 @@ func networkCreateCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n := &network.Network{Name: args[0], Internal: internal, NoICC: !icc, MTU: mtu}
 			var err error
-			if n.Subnet, err = netip.ParsePrefix(subnet); err != nil {
-				return fmt.Errorf("--subnet: %w", err)
+			// One --subnet and --gateway per address family, as in Docker.
+			for _, sub := range subnets {
+				p, err := netip.ParsePrefix(sub)
+				if err != nil {
+					return fmt.Errorf("--subnet: %w", err)
+				}
+				dst := &n.Subnet
+				if p.Addr().Is6() {
+					dst = &n.Subnet6
+				}
+				if dst.IsValid() {
+					return fmt.Errorf("--subnet: at most one IPv4 and one IPv6 subnet")
+				}
+				*dst = p
 			}
-			if gateway != "" {
-				if n.Gateway, err = netip.ParseAddr(gateway); err != nil {
+			for _, g := range gateways {
+				a, err := netip.ParseAddr(g)
+				if err != nil {
 					return fmt.Errorf("--gateway: %w", err)
+				}
+				if a.Is6() {
+					n.Gateway6 = a
+				} else {
+					n.Gateway = a
 				}
 			}
 			if n.Mode, err = netkit.ParseMode(mode); err != nil {
@@ -51,8 +70,8 @@ func networkCreateCmd() *cobra.Command {
 		},
 	}
 	fl := cmd.Flags()
-	fl.StringVar(&subnet, "subnet", "", "IPv4 subnet in CIDR format (required)")
-	fl.StringVar(&gateway, "gateway", "", "Gateway address (default: first address of the subnet)")
+	fl.StringArrayVar(&subnets, "subnet", nil, "Subnet in CIDR format: one IPv4 (required) and optionally one IPv6")
+	fl.StringArrayVar(&gateways, "gateway", nil, "Gateway per family (default: the first address of each subnet)")
 	fl.StringVar(&mode, "netkit-mode", "l3", "netkit device mode: l3 (no ARP) or l2")
 	fl.BoolVar(&internal, "internal", false, "Restrict external access to the network")
 	fl.BoolVar(&icc, "icc", true, "Allow traffic between containers of the network (--icc=false blocks it)")
@@ -75,7 +94,12 @@ func networkLsCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 3, ' ', 0)
 			fmt.Fprintln(tw, "NAME\tSUBNET\tGATEWAY\tNETKIT MODE\tINTERNAL\tICC")
 			for _, n := range nets {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%v\n", n.Name, n.Subnet, n.Gateway, n.Mode, n.Internal, !n.NoICC)
+				subnet, gateway := n.Subnet.String(), n.Gateway.String()
+				if n.HasIPv6() {
+					subnet += "," + n.Subnet6.String()
+					gateway += "," + n.Gateway6.String()
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%v\n", n.Name, subnet, gateway, n.Mode, n.Internal, !n.NoICC)
 			}
 			return tw.Flush()
 		},
@@ -112,6 +136,7 @@ func networkInspectCmd() *cobra.Command {
 				IfName    string `json:"ifname"`
 				HostIf    string `json:"host_if"`
 				IP        string `json:"ip"`
+				IP6       string `json:"ip6,omitempty"`
 			}
 			type view struct {
 				*network.Network
@@ -131,7 +156,11 @@ func networkInspectCmd() *cobra.Command {
 				for _, c := range cs {
 					for _, ep := range c.Endpoints {
 						if ep.Network == n.Name {
-							v.Containers = append(v.Containers, attached{c.Name, ep.IfName, ep.HostIf, ep.IP.String()})
+							a := attached{Container: c.Name, IfName: ep.IfName, HostIf: ep.HostIf, IP: ep.IP.String()}
+							if ep.IP6.IsValid() {
+								a.IP6 = ep.IP6.String()
+							}
+							v.Containers = append(v.Containers, a)
 						}
 					}
 				}

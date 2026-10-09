@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os/exec"
 	"strings"
 )
@@ -20,6 +21,15 @@ add chain ip netker output { type nat hook output priority dstnat; policy accept
 add chain ip netker forward { type filter hook forward priority filter; policy accept; }
 `
 
+// nftBase6 is the IPv6 counterpart, used by networks with an IPv6 subnet.
+const nftBase6 = `
+add table ip6 netker
+add chain ip6 netker postrouting { type nat hook postrouting priority srcnat; policy accept; }
+add chain ip6 netker forward { type filter hook forward priority filter; policy accept; }
+`
+
+var nftFamilies = []string{"ip", "ip6"}
+
 func netComment(name string) string { return "netker:net:" + name }
 func ctrComment(id string) string   { return "netker:ctr:" + id }
 
@@ -35,13 +45,15 @@ func nft(script string) error {
 }
 
 type nftRule struct {
+	Family  string
 	Chain   string
 	Handle  int
 	Comment string
 }
 
-func listRules() ([]nftRule, error) {
-	out, err := exec.Command("nft", "-j", "list", "table", "ip", nftTable).Output()
+// listRules lists the rules in netker's table of one family (ip or ip6).
+func listRules(family string) ([]nftRule, error) {
+	out, err := exec.Command("nft", "-j", "list", "table", family, nftTable).Output()
 	if err != nil {
 		// The table doesn't exist yet.
 		return nil, nil
@@ -66,20 +78,22 @@ func listRules() ([]nftRule, error) {
 		if err := json.Unmarshal(raw, &r); err != nil {
 			return nil, err
 		}
-		rules = append(rules, nftRule{Chain: r.Chain, Handle: r.Handle, Comment: r.Comment})
+		rules = append(rules, nftRule{Family: family, Chain: r.Chain, Handle: r.Handle, Comment: r.Comment})
 	}
 	return rules, nil
 }
 
 func deleteRulesWithComment(comment string) error {
-	rules, err := listRules()
-	if err != nil {
-		return err
-	}
 	var b strings.Builder
-	for _, r := range rules {
-		if r.Comment == comment {
-			fmt.Fprintf(&b, "delete rule ip %s %s handle %d\n", nftTable, r.Chain, r.Handle)
+	for _, family := range nftFamilies {
+		rules, err := listRules(family)
+		if err != nil {
+			return err
+		}
+		for _, r := range rules {
+			if r.Comment == comment {
+				fmt.Fprintf(&b, "delete rule %s %s %s handle %d\n", family, nftTable, r.Chain, r.Handle)
+			}
 		}
 	}
 	if b.Len() == 0 {
@@ -89,9 +103,20 @@ func deleteRulesWithComment(comment string) error {
 }
 
 // ensureNetworkRules installs masquerading (or, for internal networks, a
-// forward drop) for n once.
+// forward drop) and the --icc=false rule for n once, for IPv4 and, if the
+// network has it, IPv6.
 func ensureNetworkRules(n *Network) error {
-	rules, err := listRules()
+	if err := ensureFamilyRules(n, "ip", nftBase, n.Subnet); err != nil {
+		return err
+	}
+	if n.HasIPv6() {
+		return ensureFamilyRules(n, "ip6", nftBase6, n.Subnet6)
+	}
+	return nil
+}
+
+func ensureFamilyRules(n *Network, family, base string, subnet netip.Prefix) error {
+	rules, err := listRules(family)
 	if err != nil {
 		return err
 	}
@@ -101,17 +126,20 @@ func ensureNetworkRules(n *Network) error {
 			return nil
 		}
 	}
+	// In nft the address match keyword is the family name: "ip saddr",
+	// "ip6 saddr".
+	f := family
 	var b strings.Builder
-	b.WriteString(nftBase)
+	b.WriteString(base)
 	if n.Internal {
-		fmt.Fprintf(&b, "add rule ip netker forward ip saddr %s ip daddr != %s drop comment %q\n", n.Subnet, n.Subnet, c)
-		fmt.Fprintf(&b, "add rule ip netker forward ip daddr %s ip saddr != %s drop comment %q\n", n.Subnet, n.Subnet, c)
+		fmt.Fprintf(&b, "add rule %s netker forward %s saddr %s %s daddr != %s drop comment %q\n", f, f, subnet, f, subnet, c)
+		fmt.Fprintf(&b, "add rule %s netker forward %s daddr %s %s saddr != %s drop comment %q\n", f, f, subnet, f, subnet, c)
 	} else {
-		fmt.Fprintf(&b, "add rule ip netker postrouting ip saddr %s ip daddr != %s masquerade comment %q\n", n.Subnet, n.Subnet, c)
+		fmt.Fprintf(&b, "add rule %s netker postrouting %s saddr %s %s daddr != %s masquerade comment %q\n", f, f, subnet, f, subnet, c)
 	}
 	if n.NoICC {
 		// Published ports were DNATed and stay reachable, as in BPF.
-		fmt.Fprintf(&b, "add rule ip netker forward ip saddr %s ip daddr %s ct status != dnat drop comment %q\n", n.Subnet, n.Subnet, c)
+		fmt.Fprintf(&b, "add rule %s netker forward %s saddr %s %s daddr %s ct status != dnat drop comment %q\n", f, f, subnet, f, subnet, c)
 	}
 	return nft(b.String())
 }

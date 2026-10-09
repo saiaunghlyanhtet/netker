@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/saiaunghlyanhtet/netker/internal/idutil"
+	"github.com/saiaunghlyanhtet/netker/internal/network"
 )
 
 // hostsFile renders c's /etc/hosts: its own addresses, then every other
@@ -20,7 +21,7 @@ func hostsFile(c *Container, all []*Container) []byte {
 	var b strings.Builder
 	b.WriteString("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
 	for _, ep := range c.Endpoints {
-		fmt.Fprintf(&b, "%s\t%s\n", ep.IP, names(c))
+		writeEndpoint(&b, ep, names(c))
 	}
 	mine := map[string]bool{}
 	for _, ep := range c.Endpoints {
@@ -34,11 +35,18 @@ func hostsFile(c *Container, all []*Container) []byte {
 		}
 		for _, ep := range d.Endpoints {
 			if mine[ep.Network] {
-				fmt.Fprintf(&b, "%s\t%s\n", ep.IP, names(d))
+				writeEndpoint(&b, ep, names(d))
 			}
 		}
 	}
 	return []byte(b.String())
+}
+
+func writeEndpoint(b *strings.Builder, ep *network.Endpoint, names string) {
+	fmt.Fprintf(b, "%s\t%s\n", ep.IP, names)
+	if ep.IP6.IsValid() {
+		fmt.Fprintf(b, "%s\t%s\n", ep.IP6, names)
+	}
 }
 
 // names lists the names a container answers to: its name, its hostname
