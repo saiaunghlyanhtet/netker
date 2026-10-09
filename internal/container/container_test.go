@@ -113,3 +113,16 @@ func TestHostsFile(t *testing.T) {
 		t.Fatalf("a container on another network was listed:\n%s", got)
 	}
 }
+
+func TestHostsFileIPv6(t *testing.T) {
+	a := &Container{ID: "aaaaaaaaaaaa1111", Name: "a", Hostname: "aaaaaaaaaaaa", Endpoints: []*network.Endpoint{
+		{Network: "v6", IP: netip.MustParseAddr("10.89.0.2"), IP6: netip.MustParseAddr("fd00:89::2")}}}
+	b := &Container{ID: "bbbbbbbbbbbb2222", Name: "b", Hostname: "bbbbbbbbbbbb", Endpoints: []*network.Endpoint{
+		{Network: "v6", IP: netip.MustParseAddr("10.89.0.3"), IP6: netip.MustParseAddr("fd00:89::3")}}}
+	got := string(hostsFile(a, []*Container{a, b}))
+	for _, want := range []string{"fd00:89::2\ta aaaaaaaaaaaa\n", "10.89.0.3\tb bbbbbbbbbbbb\n", "fd00:89::3\tb bbbbbbbbbbbb\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}

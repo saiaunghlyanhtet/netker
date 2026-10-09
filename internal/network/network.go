@@ -45,7 +45,13 @@ type Network struct {
 	Internal bool         `json:"internal"`
 	// NoICC blocks traffic between the network's containers (--icc=false).
 	NoICC bool `json:"no_icc,omitempty"`
+	// Subnet6 and Gateway6 are set on networks that also carry IPv6.
+	Subnet6  netip.Prefix `json:"subnet6,omitzero"`
+	Gateway6 netip.Addr   `json:"gateway6,omitzero"`
 }
+
+// HasIPv6 reports whether containers on n get an IPv6 address too.
+func (n *Network) HasIPv6() bool { return n.Subnet6.IsValid() }
 
 type Store struct {
 	paths config.Paths
@@ -116,6 +122,27 @@ func (s *Store) Create(n *Network) error {
 	if n.Mode == "" {
 		n.Mode = netkit.ModeL3
 	}
+	if n.HasIPv6() {
+		if !n.Subnet6.Addr().Is6() || n.Subnet6.Addr().Is4In6() {
+			return fmt.Errorf("%s is not an IPv6 subnet", n.Subnet6)
+		}
+		if n.Subnet6.Bits() < 48 || n.Subnet6.Bits() > 120 {
+			return fmt.Errorf("IPv6 subnet %s: prefix length must be between /48 and /120", n.Subnet6)
+		}
+		if n.Mode == netkit.ModeL2 {
+			// L2 needs neighbour discovery through the datapath.
+			return fmt.Errorf("IPv6 on netkit L2 networks is not supported yet")
+		}
+		n.Subnet6 = n.Subnet6.Masked()
+		if !n.Gateway6.IsValid() {
+			n.Gateway6 = n.Subnet6.Addr().Next()
+		}
+		if !n.Subnet6.Contains(n.Gateway6) {
+			return fmt.Errorf("gateway %s not in subnet %s", n.Gateway6, n.Subnet6)
+		}
+	} else if n.Gateway6.IsValid() {
+		return fmt.Errorf("IPv6 gateway %s given without an IPv6 subnet", n.Gateway6)
+	}
 	if n.MTU == 0 {
 		n.MTU = DefaultMTU
 	}
@@ -126,6 +153,9 @@ func (s *Store) Create(n *Network) error {
 	for _, o := range all {
 		if o.Subnet.Overlaps(n.Subnet) {
 			return fmt.Errorf("subnet %s overlaps network %s (%s)", n.Subnet, o.Name, o.Subnet)
+		}
+		if n.HasIPv6() && o.HasIPv6() && o.Subnet6.Overlaps(n.Subnet6) {
+			return fmt.Errorf("subnet %s overlaps network %s (%s)", n.Subnet6, o.Name, o.Subnet6)
 		}
 	}
 	return s.save(n, false)
@@ -195,11 +225,17 @@ func (s *Store) Remove(name string, inUse bool) error {
 	if err := removeNetworkRules(name); err != nil {
 		return err
 	}
-	os.Remove(filepath.Join(s.paths.IPAM(), name+".json"))
-	os.Remove(filepath.Join(s.paths.IPAM(), name+".json.lock"))
+	for _, f := range []string{name, name + "@v6"} {
+		os.Remove(filepath.Join(s.paths.IPAM(), f+".json"))
+		os.Remove(filepath.Join(s.paths.IPAM(), f+".json.lock"))
+	}
 	return os.Remove(s.file(name))
 }
 
 func (s *Store) pool(n *Network) (*ipam.Pool, error) {
 	return ipam.New(s.paths.IPAM(), n.Name, n.Subnet, n.Gateway)
+}
+
+func (s *Store) pool6(n *Network) (*ipam.Pool, error) {
+	return ipam.New(s.paths.IPAM(), n.Name+"@v6", n.Subnet6, n.Gateway6) // "@" is not allowed in names
 }

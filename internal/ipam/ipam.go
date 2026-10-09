@@ -31,13 +31,11 @@ type state struct {
 	Last string `json:"last,omitempty"`
 }
 
-// New returns the pool for subnet stored at dir/<name>.json. The network and
-// broadcast addresses and the gateway are never handed out.
+// New returns the pool for an IPv4 or IPv6 subnet, stored at
+// dir/<name>.json. The network address, the gateway and, for IPv4, the
+// broadcast address are never handed out.
 func New(dir, name string, subnet netip.Prefix, gateway netip.Addr) (*Pool, error) {
-	if !subnet.Addr().Is4() {
-		return nil, fmt.Errorf("only IPv4 subnets are supported, got %s", subnet)
-	}
-	if subnet.Bits() > 30 {
+	if subnet.Bits() > subnet.Addr().BitLen()-2 {
 		return nil, fmt.Errorf("subnet %s is too small", subnet)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -101,7 +99,7 @@ func (p *Pool) usable(a netip.Addr) error {
 	if !p.subnet.Contains(a) {
 		return fmt.Errorf("address %s not in subnet %s", a, p.subnet)
 	}
-	if a == p.subnet.Addr() || a == p.broadcast() || a == p.gateway {
+	if a == p.subnet.Addr() || a == p.gateway || (a.Is4() && a == p.broadcast()) {
 		return fmt.Errorf("address %s is reserved", a)
 	}
 	return nil
@@ -116,8 +114,15 @@ func (p *Pool) broadcast() netip.Addr {
 	return netip.AddrFrom4(b)
 }
 
+// maxSearch bounds the scan for a free address; an IPv6 /64 can't be
+// walked, and its pool runs out of tracked addresses long before.
+const maxSearch = 1 << 20
+
 func (p *Pool) search(s *state, start netip.Addr) (netip.Addr, error) {
-	size := 1 << (32 - p.subnet.Bits())
+	size := maxSearch
+	if hostBits := p.subnet.Addr().BitLen() - p.subnet.Bits(); hostBits < 20 {
+		size = 1 << hostBits
+	}
 	a := start
 	for i := 0; i < size; i++ {
 		if !p.subnet.Contains(a) {

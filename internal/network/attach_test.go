@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -418,5 +419,154 @@ func TestNoICC(t *testing.T) {
 	}
 	if epA.Datapath == DatapathEBPF && metric(t, s, epA.HostIfIndex, "drop-icc") == 0 {
 		t.Fatal("blocked traffic not counted as drop-icc")
+	}
+}
+
+func TestCreateIPv6Validation(t *testing.T) {
+	s, _ := testStore(t)
+	ok := &Network{Name: "v6", Subnet: netip.MustParsePrefix("10.89.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:89::/64")}
+	if err := s.Create(ok); err != nil {
+		t.Fatal(err)
+	}
+	if ok.Gateway6 != netip.MustParseAddr("fd00:89::1") {
+		t.Fatalf("default IPv6 gateway %s", ok.Gateway6)
+	}
+	bad := map[string]*Network{
+		"L2 with IPv6":     {Name: "b1", Subnet: netip.MustParsePrefix("10.88.1.0/24"), Subnet6: netip.MustParsePrefix("fd00:1::/64"), Mode: netkit.ModeL2},
+		"overlapping v6":   {Name: "b2", Subnet: netip.MustParsePrefix("10.88.2.0/24"), Subnet6: netip.MustParsePrefix("fd00:89::/80")},
+		"v4 as v6":         {Name: "b3", Subnet: netip.MustParsePrefix("10.88.3.0/24"), Subnet6: netip.MustParsePrefix("10.88.4.0/24")},
+		"too large":        {Name: "b4", Subnet: netip.MustParsePrefix("10.88.5.0/24"), Subnet6: netip.MustParsePrefix("fd00::/32")},
+		"gateway6 outside": {Name: "b5", Subnet: netip.MustParsePrefix("10.88.6.0/24"), Subnet6: netip.MustParsePrefix("fd00:6::/64"), Gateway6: netip.MustParseAddr("fd00:7::1")},
+		"gateway6 alone":   {Name: "b6", Subnet: netip.MustParsePrefix("10.88.7.0/24"), Gateway6: netip.MustParseAddr("fd00:7::1")},
+	}
+	for name, n := range bad {
+		if err := s.Create(n); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func readSysctl(t *testing.T, key string) string {
+	t.Helper()
+	b, err := os.ReadFile("/proc/sys/" + key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func TestIPv6Legacy(t *testing.T) {
+	requireNetAdmin(t)
+	t.Setenv("NETKER_DATAPATH", "legacy")
+	s, p := testStore(t)
+	// An uplink that learns its address from router advertisements.
+	ra := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "ra0"}}
+	if err := netlink.LinkAdd(ra); err != nil {
+		t.Fatal(err)
+	}
+	defer netlink.LinkDel(ra)
+	os.WriteFile("/proc/sys/net/ipv6/conf/ra0/accept_ra", []byte("1"), 0o644)
+	os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("0"), 0o644)
+
+	n := &Network{Name: "v6", Subnet: netip.MustParsePrefix("10.89.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:89::/64")}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	a, b := "6a6a6a6a6a6a6a6a", "6b6b6b6b6b6b6b6b"
+	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
+	epA, err := s.Attach(n, a, nsA, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epA, a)
+	epB, err := s.Attach(n, b, nsB, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epB, b)
+	if !n.Subnet6.Contains(epA.IP6) || epA.Gateway6 != n.Gateway6 || epA.IP6 == epB.IP6 {
+		t.Fatalf("IPv6 addresses: A %s, B %s, gateway %s", epA.IP6, epB.IP6, epA.Gateway6)
+	}
+
+	if got := readSysctl(t, "net/ipv6/conf/all/forwarding"); got != "1" {
+		t.Fatalf("IPv6 forwarding %s", got)
+	}
+	if got := readSysctl(t, "net/ipv6/conf/ra0/accept_ra"); got != "2" {
+		t.Fatalf("accept_ra on an RA-configured interface is %s after enabling forwarding, want 2", got)
+	}
+
+	err = netns.Do(nsA, func() error {
+		routes, err := netlink.RouteGet(net.ParseIP("2001:db8::1"))
+		if err != nil {
+			return fmt.Errorf("no IPv6 default route: %w", err)
+		}
+		if gw := routes[0].Gw.String(); gw != epA.Gateway6.String() {
+			return fmt.Errorf("IPv6 default route via %s, want %s", gw, epA.Gateway6)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listenIn6 := func(ns, addr string) {
+		var ln net.Listener
+		listen := func() error {
+			var err error
+			ln, err = net.Listen("tcp6", addr)
+			return err
+		}
+		if ns == "" {
+			err = listen()
+		} else {
+			err = netns.Do(ns, listen)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				fmt.Fprint(c, "hello over v6")
+				c.Close()
+			}
+		}()
+	}
+	dial6 := func(ns, addr string) (string, error) {
+		var got []byte
+		err := netns.Do(ns, func() error {
+			c, err := net.DialTimeout("tcp6", addr, 2*time.Second)
+			if err != nil {
+				return err
+			}
+			defer c.Close()
+			got, err = io.ReadAll(c)
+			return err
+		})
+		return string(got), err
+	}
+	listenIn6(nsB, netip.AddrPortFrom(epB.IP6, 9000).String())
+	if got, err := dial6(nsA, netip.AddrPortFrom(epB.IP6, 9000).String()); err != nil || got != "hello over v6" {
+		t.Fatalf("A->B over IPv6: %q, %v", got, err)
+	}
+	listenIn6("", netip.AddrPortFrom(epA.Gateway6, 8087).String())
+	if got, err := dial6(nsA, netip.AddrPortFrom(epA.Gateway6, 8087).String()); err != nil || got != "hello over v6" {
+		t.Fatalf("A->IPv6 gateway: %q, %v", got, err)
+	}
+
+	out, err := exec.Command("nft", "list", "table", "ip6", "netker").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ip6 saddr fd00:89::/64 ip6 daddr != fd00:89::/64 masquerade") {
+		t.Fatalf("no IPv6 masquerade rule: %v\n%s", err, out)
+	}
+	if err := s.Remove("v6", false); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = exec.Command("nft", "list", "table", "ip6", "netker").CombinedOutput()
+	if strings.Contains(string(out), "netker:net:v6") {
+		t.Fatalf("IPv6 rules left after network rm:\n%s", out)
 	}
 }

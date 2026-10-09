@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -629,4 +631,21 @@ func TestEBPFL2AntiSpoofing(t *testing.T) {
 			t.Fatal("ARP with a fake sender MAC was not dropped")
 		}
 	})
+}
+
+func TestEBPFRejectsIPv6Networks(t *testing.T) {
+	s, _ := ebpfStore(t)
+	n := &Network{Name: "v6", Subnet: netip.MustParsePrefix("10.89.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:89::/64")}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	id := "6c6c6c6c6c6c6c6c"
+	ns := newNS(t, s.paths, id)
+	_, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
+	if err == nil || !strings.Contains(err.Error(), "NETKER_DATAPATH=legacy") {
+		t.Fatalf("eBPF attach to an IPv6 network: %v", err)
+	}
+	if links, _ := netlink.LinkList(); slices.ContainsFunc(links, func(l netlink.Link) bool { return l.Attrs().Name == HostIfName(id, 0) }) {
+		t.Fatal("netkit pair left behind after the rejected attach")
+	}
 }

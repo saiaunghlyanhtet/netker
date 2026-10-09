@@ -7,24 +7,29 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/saiaunghlyanhtet/netker/internal/config"
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
+	"github.com/saiaunghlyanhtet/netker/internal/ipam"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
 	"github.com/saiaunghlyanhtet/netker/internal/netns"
 )
 
 // Endpoint is one container interface on one network.
 type Endpoint struct {
-	Network string      `json:"network"`
-	IfName  string      `json:"ifname"`  // inside the container, e.g. eth0
-	HostIf  string      `json:"host_if"` // netkit primary in the host netns
-	IP      netip.Addr  `json:"ip"`
-	Gateway netip.Addr  `json:"gateway"`
-	Mode    netkit.Mode `json:"netkit_mode"`
+	Network string     `json:"network"`
+	IfName  string     `json:"ifname"`  // inside the container, e.g. eth0
+	HostIf  string     `json:"host_if"` // netkit primary in the host netns
+	IP      netip.Addr `json:"ip"`
+	Gateway netip.Addr `json:"gateway"`
+	// IP6 and Gateway6 are set on networks with an IPv6 subnet.
+	IP6      netip.Addr  `json:"ip6,omitzero"`
+	Gateway6 netip.Addr  `json:"gateway6,omitzero"`
+	Mode     netkit.Mode `json:"netkit_mode"`
 	// Default is set on the attachment that carries the default route.
 	Default bool `json:"default_route,omitempty"`
 	// Datapath is "ebpf" or "legacy", fixed when the endpoint is created.
@@ -63,9 +68,24 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err != nil {
 		return nil, err
 	}
+	if n.HasIPv6() && mode == DatapathEBPF {
+		return nil, fmt.Errorf("network %s has IPv6, which the eBPF datapath doesn't handle yet; use NETKER_DATAPATH=legacy", n.Name)
+	}
 	ip, err := pool.Allocate(containerID, want)
 	if err != nil {
 		return nil, err
+	}
+	var ip6 netip.Addr
+	var pool6 *ipam.Pool
+	if n.HasIPv6() {
+		if pool6, err = s.pool6(n); err != nil {
+			pool.Release(ip)
+			return nil, err
+		}
+		if ip6, err = pool6.Allocate(containerID, netip.Addr{}); err != nil {
+			pool.Release(ip)
+			return nil, err
+		}
 	}
 	hostIf := HostIfName(containerID, idx)
 	ep = &Endpoint{
@@ -74,6 +94,8 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 		HostIf:   hostIf,
 		IP:       ip,
 		Gateway:  n.Gateway,
+		IP6:      ip6,
+		Gateway6: n.Gateway6,
 		Mode:     n.Mode,
 		Datapath: mode,
 		Default:  defaultRoute,
@@ -86,6 +108,9 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 				_ = s.dp.Detach(containerID, hostIf, ip)
 			}
 			_ = pool.Release(ip)
+			if pool6 != nil {
+				_ = pool6.Release(ip6)
+			}
 		}
 	}()
 
@@ -116,7 +141,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	}
 	var peer netlink.Link
 	err = netns.Do(nsPath, func() error {
-		if err := setupContainerSide(ep, n.Subnet, defaultRoute); err != nil {
+		if err := setupContainerSide(ep, n.Subnet, n.Subnet6, defaultRoute); err != nil {
 			return err
 		}
 		peer, err = netlink.LinkByName(ep.IfName)
@@ -199,6 +224,13 @@ func (s *Store) Detach(ep *Endpoint, containerID string) error {
 		err = pool.ReleaseOwner(containerID)
 	}
 	errs = append(errs, err)
+	if n.HasIPv6() {
+		pool6, err := s.pool6(n)
+		if err == nil {
+			err = pool6.ReleaseOwner(containerID)
+		}
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -232,14 +264,77 @@ func setupHostSide(ep *Endpoint) error {
 	if err := netlink.RouteReplace(route); err != nil {
 		return fmt.Errorf("route to %s: %w", ep.IP, err)
 	}
+	if ep.IP6.IsValid() {
+		return setupHostSide6(host, ep)
+	}
 	return nil
+}
+
+// setupHostSide6 mirrors the IPv4 setup: the IPv6 gateway on the primary
+// (without duplicate address detection, it's on every primary of the
+// network), a host route to the container, and IPv6 forwarding.
+func setupHostSide6(host netlink.Link, ep *Endpoint) error {
+	dev := ep.HostIf
+	for key, val := range map[string]string{"disable_ipv6": "0", "accept_ra": "0", "autoconf": "0"} {
+		if err := writeSysctl(fmt.Sprintf("net/ipv6/conf/%s/%s", dev, key), val); err != nil {
+			return err
+		}
+	}
+	gw := &netlink.Addr{IPNet: hostNet(ep.Gateway6), Flags: unix.IFA_F_NOPREFIXROUTE | unix.IFA_F_NODAD}
+	if err := netlink.AddrAdd(host, gw); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("add IPv6 gateway address: %w", err)
+	}
+	if err := enableIPv6Forwarding(); err != nil {
+		return err
+	}
+	route := &netlink.Route{
+		LinkIndex: host.Attrs().Index,
+		Dst:       hostNet(ep.IP6),
+		Scope:     netlink.SCOPE_LINK,
+		Src:       net.IP(ep.Gateway6.AsSlice()),
+	}
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("route to %s: %w", ep.IP6, err)
+	}
+	return nil
+}
+
+// enableIPv6Forwarding turns on IPv6 forwarding. A forwarding host ignores
+// router advertisements on interfaces with accept_ra=1, which would drop
+// its own SLAAC addresses and default route, so those interfaces are moved
+// to accept_ra=2 (accept RAs even when forwarding) first.
+func enableIPv6Forwarding() error {
+	cur, err := os.ReadFile("/proc/sys/net/ipv6/conf/all/forwarding")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(cur)) == "1" {
+		return nil
+	}
+	ifaces, err := os.ReadDir("/proc/sys/net/ipv6/conf")
+	if err != nil {
+		return err
+	}
+	for _, e := range ifaces {
+		name := e.Name()
+		if name == "all" || name == "default" || name == "lo" {
+			continue
+		}
+		p := filepath.Join("net/ipv6/conf", name, "accept_ra")
+		if v, err := os.ReadFile(filepath.Join("/proc/sys", p)); err == nil && strings.TrimSpace(string(v)) == "1" {
+			if err := writeSysctl(p, "2"); err != nil {
+				return err
+			}
+		}
+	}
+	return writeSysctl("net/ipv6/conf/all/forwarding", "1")
 }
 
 // setupContainerSide configures the container's end. The first attachment
 // carries the default route; later ones get a route to their own subnet, so
 // traffic to that network leaves through its interface (and BPF sees it on
 // the right endpoint).
-func setupContainerSide(ep *Endpoint, subnet netip.Prefix, defaultRoute bool) error {
+func setupContainerSide(ep *Endpoint, subnet, subnet6 netip.Prefix, defaultRoute bool) error {
 	lo, err := netlink.LinkByName("lo")
 	if err != nil {
 		return err
@@ -254,10 +349,17 @@ func setupContainerSide(ep *Endpoint, subnet netip.Prefix, defaultRoute bool) er
 	if err := netlink.AddrAdd(l, &netlink.Addr{IPNet: hostNet(ep.IP)}); err != nil {
 		return fmt.Errorf("address %s: %w", ep.IP, err)
 	}
-	// No IPv6 on netker networks yet, so don't let the container send
-	// router solicitations and MLD reports (Docker does the same).
-	if err := writeSysctl(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", ep.IfName), "1"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	// IPv6 only on IPv6 networks; otherwise the container would still send
+	// router solicitations and MLD reports (Docker disables it too). With
+	// IPv6, addresses come from netker only: no SLAAC, RAs or DAD.
+	v6 := map[string]string{"disable_ipv6": "1"}
+	if ep.IP6.IsValid() {
+		v6 = map[string]string{"disable_ipv6": "0", "accept_ra": "0", "autoconf": "0", "accept_dad": "0"}
+	}
+	for key, val := range v6 {
+		if err := writeSysctl(fmt.Sprintf("net/ipv6/conf/%s/%s", ep.IfName, key), val); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if err := netlink.LinkSetUp(l); err != nil {
 		return err
@@ -278,6 +380,35 @@ func setupContainerSide(ep *Endpoint, subnet netip.Prefix, defaultRoute bool) er
 	}
 	if err := netlink.RouteAdd(route); err != nil {
 		return fmt.Errorf("route via %s: %w", ep.Gateway, err)
+	}
+	if ep.IP6.IsValid() {
+		return setupContainerSide6(l, ep, subnet6, defaultRoute)
+	}
+	return nil
+}
+
+func setupContainerSide6(l netlink.Link, ep *Endpoint, subnet6 netip.Prefix, defaultRoute bool) error {
+	if err := netlink.AddrAdd(l, &netlink.Addr{IPNet: hostNet(ep.IP6), Flags: unix.IFA_F_NODAD}); err != nil {
+		return fmt.Errorf("address %s: %w", ep.IP6, err)
+	}
+	if err := netlink.RouteAdd(&netlink.Route{
+		LinkIndex: l.Attrs().Index,
+		Dst:       hostNet(ep.Gateway6),
+		Scope:     netlink.SCOPE_LINK,
+	}); err != nil {
+		return fmt.Errorf("route to IPv6 gateway: %w", err)
+	}
+	route := &netlink.Route{
+		LinkIndex: l.Attrs().Index,
+		Gw:        net.IP(ep.Gateway6.AsSlice()),
+	}
+	if defaultRoute {
+		route.Dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+	} else {
+		route.Dst = &net.IPNet{IP: net.IP(subnet6.Masked().Addr().AsSlice()), Mask: net.CIDRMask(subnet6.Bits(), 128)}
+	}
+	if err := netlink.RouteAdd(route); err != nil {
+		return fmt.Errorf("route via %s: %w", ep.Gateway6, err)
 	}
 	return nil
 }
@@ -321,9 +452,19 @@ func (s *Store) SetDefaultRoute(nsPath string, ep *Endpoint) error {
 		if err != nil {
 			return err
 		}
-		return netlink.RouteReplace(&netlink.Route{
+		if err := netlink.RouteReplace(&netlink.Route{
 			LinkIndex: l.Attrs().Index,
 			Gw:        net.IP(ep.Gateway.AsSlice()),
+		}); err != nil {
+			return err
+		}
+		if !ep.IP6.IsValid() {
+			return nil
+		}
+		return netlink.RouteReplace(&netlink.Route{
+			LinkIndex: l.Attrs().Index,
+			Dst:       &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+			Gw:        net.IP(ep.Gateway6.AsSlice()),
 		})
 	})
 	if err != nil {

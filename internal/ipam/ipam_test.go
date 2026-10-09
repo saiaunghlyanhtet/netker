@@ -113,3 +113,46 @@ func TestConcurrentAllocationsAreUnique(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestIPv6Pool(t *testing.T) {
+	p := newPool(t, "fd00:87::/64", "fd00:87::1")
+	a, err := p.Allocate("c", netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != netip.MustParseAddr("fd00:87::2") {
+		t.Fatalf("first IPv6 address %s, want fd00:87::2 (::0 and the gateway are reserved)", a)
+	}
+	b, _ := p.Allocate("d", netip.Addr{})
+	if b != netip.MustParseAddr("fd00:87::3") {
+		t.Fatalf("second address %s", b)
+	}
+	// The last address of an IPv6 subnet is usable: there's no broadcast.
+	last := netip.MustParseAddr("fd00:87::ffff:ffff:ffff:ffff")
+	if _, err := p.Allocate("e", last); err != nil {
+		t.Fatalf("last address of a /64: %v", err)
+	}
+	for _, bad := range []string{"fd00:87::", "fd00:87::1", "fd00:88::5"} {
+		if _, err := p.Allocate("f", netip.MustParseAddr(bad)); err == nil {
+			t.Fatalf("%s should be rejected", bad)
+		}
+	}
+}
+
+func TestIPv6SmallPoolExhausts(t *testing.T) {
+	p := newPool(t, "fd00:87::/126", "fd00:87::1")
+	var got []string
+	for {
+		a, err := p.Allocate("c", netip.Addr{})
+		if errors.Is(err, ErrExhausted) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, a.String())
+	}
+	if len(got) != 2 || got[0] != "fd00:87::2" || got[1] != "fd00:87::3" {
+		t.Fatalf("got %v, want [fd00:87::2 fd00:87::3]", got)
+	}
+}

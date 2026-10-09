@@ -9,9 +9,10 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 >/dev/null 2>&1 || true
-	netker network rm e2e-two e2e-iso >/dev/null 2>&1 || true
-	netker network rm e2e-l2 >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-v6a >/dev/null 2>&1 || true
+	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
+		netker network rm "$n" >/dev/null 2>&1 || true
+	done
 	ip link del e2e-pub0 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -158,6 +159,26 @@ netker rm e2e-none >/dev/null
 
 netker rm -f e2e-solo >/dev/null
 netker network rm e2e-two >/dev/null
+
+# IPv6 (chunk 6a: host-stack forwarding, so the legacy datapath only).
+netker network create --subnet 10.89.0.0/24 --subnet fd00:89::/64 e2e-v6 >/dev/null
+expect "ipv6: network ls shows the IPv6 subnet" "fd00:89::/64" "$(netker network ls)"
+v6env=()
+if [[ "$datapath" == ebpf ]]; then
+	expect "ipv6: eBPF datapath rejects IPv6 networks for now" "NETKER_DATAPATH=legacy" \
+		"$(netker run --rm --network e2e-v6 alpine true 2>&1 || true)"
+	v6env=(env NETKER_DATAPATH=legacy)
+fi
+"${v6env[@]}" netker run -d --name e2e-v6a --network e2e-v6 alpine sleep 300 >/dev/null
+out=$("${v6env[@]}" netker run --rm --network e2e-v6 alpine sh -c \
+	"ip -6 addr show dev eth0; ip -6 route; cat /etc/hosts; ping -6 -c1 -W2 e2e-v6a; ping -6 -c1 -W2 fd00:89::1")
+expect "ipv6: container gets an address from the subnet" "inet6 fd00:89::" "$out"
+expect "ipv6: default route via the IPv6 gateway" "default via fd00:89::1 dev eth0" "$out"
+expect "ipv6: /etc/hosts lists peers' IPv6 addresses" "fd00:89::" "$(netker exec e2e-v6a cat /etc/hosts)"
+expect "ipv6: ping a peer by name over IPv6" "1 packets received" "$(echo "$out" | grep -A5 'PING e2e-v6a')"
+expect "ipv6: ping the IPv6 gateway" "1 packets received" "$(echo "$out" | grep -A5 'PING fd00:89::1')"
+netker rm -f e2e-v6a >/dev/null
+netker network rm e2e-v6 >/dev/null
 
 expect "--network none has only lo" "1: lo" "$(netker run --rm --network none alpine ip -o link)"
 
