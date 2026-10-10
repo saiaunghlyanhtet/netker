@@ -25,6 +25,9 @@
 #ifndef AF_INET
 #define AF_INET 2
 #endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
 #define LOOPBACK_IFINDEX 1 /* lo is ifindex 1 in every netns */
 
 static __always_inline bool is_mcast_or_bcast(__be32 addr)
@@ -39,14 +42,14 @@ static __always_inline bool is_mcast_or_bcast(__be32 addr)
  * netkit switches into the container's netns. bpf_redirect_peer() isn't
  * usable here: it needs tc ingress, and this runs on netkit's xmit path.
  */
-static __always_inline int to_local(struct __sk_buff *skb, __u32 self, struct endpoint *dst, __u8 reason)
+static __always_inline int to_local(struct __sk_buff *skb, __u32 self, struct endpoint *dst, __u8 reason, bool v6)
 {
 	__u32 dst_ifindex = dst->ifindex;
 	__u8 macs[12];
 
 	__builtin_memcpy(macs, dst->peer_mac, 6);
 	__builtin_memcpy(macs + 6, dst->mac, 6);
-	if (dec_ttl(skb) < 0) {
+	if ((v6 ? dec_hoplimit(skb) : dec_ttl(skb)) < 0) {
 		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
 		return NETKIT_PASS;
 	}
@@ -106,6 +109,102 @@ static __always_inline int from_container_arp(struct __sk_buff *skb, struct ethh
 	return NETKIT_PASS;
 }
 
+static __always_inline bool ip6_is_mcast(const struct in6_addr *a)
+{
+	return a->in6_u.u6_addr8[0] == 0xff;
+}
+
+static __always_inline void ip6_copy(__u32 *dst, const struct in6_addr *a)
+{
+	__builtin_memcpy(dst, a->in6_u.u6_addr32, 16);
+}
+
+/* from_container6 is nk_from_container for IPv6: the same anti-spoofing,
+ * isolation and local redirect as IPv4. Everything that leaves the host
+ * goes through the host stack for now, where nftables masquerades it.
+ */
+static __always_inline int from_container6(struct __sk_buff *skb, struct ethhdr *eth, __u32 self)
+{
+	void *data_end = (void *)(long)skb->data_end;
+	struct ipv6hdr *ip6 = (void *)(eth + 1);
+
+	if ((void *)(ip6 + 1) > data_end) {
+		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		return NETKIT_DROP;
+	}
+	/* E.g. the container's MLD reports for its solicited-node groups. */
+	if (ip6_is_mcast(&ip6->daddr)) {
+		count(self, DIR_EGRESS, REASON_DROP_MCAST, skb->len);
+		return NETKIT_DROP;
+	}
+	struct ip6_key skey, dkey;
+	__builtin_memcpy(skey.addr, &ip6->saddr, 16);
+	__builtin_memcpy(dkey.addr, &ip6->daddr, 16);
+
+	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints6, &skey);
+	if (!src || src->ifindex != self) {
+		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		return NETKIT_DROP;
+	}
+	if ((src->flags & EP_F_L2) && !mac_eq(eth->h_source, src->peer_mac)) {
+		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
+		return NETKIT_DROP;
+	}
+	__u32 src_netid = src->netid;
+	__u32 src_flags = src->flags;
+
+	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, &dkey);
+	if (dst) {
+		if (dst->netid != src_netid) {
+			count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+			return NETKIT_DROP;
+		}
+		if (src_flags & EP_F_NO_ICC) {
+			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
+			return NETKIT_DROP;
+		}
+		return to_local(skb, self, dst, REASON_FORWARD_LOCAL, true);
+	}
+
+	struct bpf_fib_lookup fib = {
+		.family = AF_INET6,
+		.ifindex = self,
+	};
+	ip6_copy(fib.ipv6_src, &ip6->saddr);
+	ip6_copy(fib.ipv6_dst, &ip6->daddr);
+	long rc = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
+	if ((rc == BPF_FIB_LKUP_RET_SUCCESS || rc == BPF_FIB_LKUP_RET_NO_NEIGH) &&
+	    (src_flags & EP_F_INTERNAL)) {
+		count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+		return NETKIT_DROP;
+	}
+	count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+	return NETKIT_PASS;
+}
+
+/* to_container6 delivers only IPv6 addressed to this endpoint. */
+static __always_inline int to_container6(struct __sk_buff *skb, struct ethhdr *eth, __u32 self_peer)
+{
+	void *data_end = (void *)(long)skb->data_end;
+	struct ipv6hdr *ip6 = (void *)(eth + 1);
+
+	if ((void *)(ip6 + 1) > data_end)
+		return NETKIT_DROP;
+	if (ip6_is_mcast(&ip6->daddr)) {
+		count(0, DIR_INGRESS, REASON_DROP_MCAST, skb->len);
+		return NETKIT_DROP;
+	}
+	struct ip6_key dkey;
+	__builtin_memcpy(dkey.addr, &ip6->daddr, 16);
+	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, &dkey);
+	if (!dst || dst->peer_ifindex != self_peer) {
+		count(dst ? dst->ifindex : 0, DIR_INGRESS, REASON_DROP_NOT_OURS, skb->len);
+		return NETKIT_DROP;
+	}
+	count(dst->ifindex, DIR_INGRESS, REASON_DELIVER, skb->len);
+	return NETKIT_PASS;
+}
+
 SEC("netkit/peer")
 int nk_from_container(struct __sk_buff *skb)
 {
@@ -121,6 +220,8 @@ int nk_from_container(struct __sk_buff *skb)
 	}
 	if (eth->h_proto == bpf_htons(ETH_P_ARP))
 		return from_container_arp(skb, eth, self);
+	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+		return from_container6(skb, eth, self);
 	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
 		count(self, DIR_EGRESS, REASON_DROP_PROTO, skb->len);
 		return NETKIT_DROP;
@@ -190,7 +291,7 @@ int nk_from_container(struct __sk_buff *skb)
 			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
 			return NETKIT_DROP;
 		}
-		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL);
+		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL, false);
 	}
 
 	struct bpf_fib_lookup fib = {
@@ -244,7 +345,7 @@ int nk_from_container(struct __sk_buff *skb)
 			count(self, DIR_EGRESS, REASON_DROP_NOT_OURS, skb->len);
 			return NETKIT_DROP;
 		}
-		return to_local(skb, self, dst, REASON_DNAT);
+		return to_local(skb, self, dst, REASON_DNAT, false);
 	}
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/* Unreachable, prohibited, ...: the stack answers with ICMP. */
@@ -301,6 +402,8 @@ int nk_to_container(struct __sk_buff *skb)
 		return NETKIT_DROP;
 	if (eth->h_proto == bpf_htons(ETH_P_ARP))
 		return NETKIT_PASS;
+	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
+		return to_container6(skb, eth, self_peer);
 	if (eth->h_proto != bpf_htons(ETH_P_IP))
 		return NETKIT_DROP;
 	struct iphdr *ip = (void *)(eth + 1);

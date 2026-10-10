@@ -102,6 +102,19 @@ static __always_inline int rewrite_port(struct __sk_buff *skb, const struct l4 *
 	return bpf_skb_store_bytes(skb, off, &new, sizeof(new), 0);
 }
 
+#define IP6_HOPLIMIT_OFF (ETH_HLEN + __builtin_offsetof(struct ipv6hdr, hop_limit))
+
+/* dec_hoplimit is dec_ttl for IPv6, which has no header checksum. */
+static __always_inline int dec_hoplimit(struct __sk_buff *skb)
+{
+	__u8 hl;
+
+	if (bpf_skb_load_bytes(skb, IP6_HOPLIMIT_OFF, &hl, 1) < 0 || hl <= 1)
+		return -1;
+	hl--;
+	return bpf_skb_store_bytes(skb, IP6_HOPLIMIT_OFF, &hl, 1, 0);
+}
+
 /* dec_ttl decrements the TTL like a router. Returns -1 if the packet must go
  * to the stack instead (TTL expiring: the kernel sends ICMP time exceeded).
  */

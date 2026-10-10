@@ -20,6 +20,7 @@ import (
 // Endpoint is what the datapath needs to know about one container interface.
 type Endpoint struct {
 	IP          netip.Addr
+	IP6         netip.Addr // zero on IPv4-only networks
 	HostIf      string
 	HostIfIndex int
 	PeerIfIndex int // ifindex inside the container netns
@@ -111,9 +112,14 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			d.Detach(containerID, ep.HostIf, ep.IP)
+			d.Detach(containerID, ep.HostIf, ep.IP, ep.IP6)
 		}
 	}()
+	if ep.IP6.IsValid() {
+		if err := d.objs.NetkerEndpoints6.Put(netkerIp6Key{Addr: ep.IP6.As16()}, val); err != nil {
+			return fmt.Errorf("IPv6 endpoint map: %w", err)
+		}
+	}
 	if err := os.MkdirAll(filepath.Join(d.linksDir(), containerID), 0o700); err != nil {
 		return err
 	}
@@ -138,15 +144,20 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	return d.EnsureHost()
 }
 
-// Detach removes the endpoint and releases its links. Missing pieces are
-// not an error.
-func (d *Datapath) Detach(containerID, hostIf string, ip netip.Addr) error {
+// Detach removes the endpoint (ip6 may be the zero Addr) and releases its
+// links. Missing pieces are not an error.
+func (d *Datapath) Detach(containerID, hostIf string, ip, ip6 netip.Addr) error {
 	var errs []error
 	if err := d.Load(); err != nil {
 		return err
 	}
 	if err := d.objs.NetkerEndpoints.Delete(ip.As4()); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		errs = append(errs, err)
+	}
+	if ip6.IsValid() {
+		if err := d.objs.NetkerEndpoints6.Delete(netkerIp6Key{Addr: ip6.As16()}); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, err)
+		}
 	}
 	for _, side := range []string{"peer", "primary"} {
 		p := d.linkPin(containerID, hostIf, side)
@@ -210,6 +221,22 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	if err := it.Err(); err != nil {
 		return links, entries, err
 	}
+	var key6 netkerIp6Key
+	var stale6 []netkerIp6Key
+	it6 := d.objs.NetkerEndpoints6.Iterate()
+	for it6.Next(&key6, &val) {
+		if _, err := net.InterfaceByIndex(int(val.Ifindex)); err != nil {
+			stale6 = append(stale6, key6)
+		}
+	}
+	for _, k := range stale6 {
+		if d.objs.NetkerEndpoints6.Delete(k) == nil {
+			entries++
+		}
+	}
+	if err := it6.Err(); err != nil {
+		return links, entries, err
+	}
 	// Published ports whose container is gone.
 	var pk netkerPortKey
 	var pv netkerPortVal
@@ -257,8 +284,16 @@ func (d *Datapath) Endpoints() ([]EndpointEntry, error) {
 	for it.Next(&key, &val) {
 		out = append(out, EndpointEntry{netip.AddrFrom4(key), val.Ifindex, val.PeerIfindex, val.Netid})
 	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	var key6 netkerIp6Key
+	it6 := d.objs.NetkerEndpoints6.Iterate()
+	for it6.Next(&key6, &val) {
+		out = append(out, EndpointEntry{netip.AddrFrom16(key6.Addr), val.Ifindex, val.PeerIfindex, val.Netid})
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].IP.Less(out[j].IP) })
-	return out, it.Err()
+	return out, it6.Err()
 }
 
 // LinkInfo describes one pinned link.

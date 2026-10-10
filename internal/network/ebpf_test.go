@@ -8,8 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +108,7 @@ func TestEBPFAttachIsFailClosed(t *testing.T) {
 	}
 
 	// Detaching the programs must cut the container off (peer policy DROP).
-	if err := s.dp.Detach(id, ep.HostIf, ep.IP); err != nil {
+	if err := s.dp.Detach(id, ep.HostIf, ep.IP, ep.IP6); err != nil {
 		t.Fatal(err)
 	}
 	listenIn(t, "", ep.Gateway.String()+":8081")
@@ -247,18 +245,20 @@ func TestEBPFUpgradeKeepsTraffic(t *testing.T) {
 // (198.51.100.1). The netker nft table is deleted so that anything that
 // works can only have been translated in BPF.
 type world struct {
-	ns     string
-	hostIP netip.Addr
-	peerIP netip.Addr
+	ns               string
+	hostIP, peerIP   netip.Addr
+	hostIP6, peerIP6 netip.Addr
 }
 
 func setupWorld(t *testing.T, s *Store) *world {
 	t.Helper()
 	t.Setenv("NETKER_UPLINKS", "uplink0")
 	w := &world{
-		ns:     newNS(t, s.paths, "world"),
-		hostIP: netip.MustParseAddr("198.51.100.2"),
-		peerIP: netip.MustParseAddr("198.51.100.1"),
+		ns:      newNS(t, s.paths, "world"),
+		hostIP:  netip.MustParseAddr("198.51.100.2"),
+		peerIP:  netip.MustParseAddr("198.51.100.1"),
+		hostIP6: netip.MustParseAddr("2001:db8:100::2"),
+		peerIP6: netip.MustParseAddr("2001:db8:100::1"),
 	}
 	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "uplink0"}, PeerName: "wld0"}
 	if err := netlink.LinkAdd(veth); err != nil {
@@ -267,6 +267,7 @@ func setupWorld(t *testing.T, s *Store) *world {
 	t.Cleanup(func() { netlink.LinkDel(veth) })
 	up, _ := netlink.LinkByName("uplink0")
 	netlink.AddrAdd(up, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.hostIP.AsSlice()), Mask: net.CIDRMask(24, 32)}})
+	netlink.AddrAdd(up, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.hostIP6.AsSlice()), Mask: net.CIDRMask(64, 128)}, Flags: unix.IFA_F_NODAD})
 	netlink.LinkSetUp(up)
 	peer, _ := netlink.LinkByName("wld0")
 	ns, err := os.Open(w.ns)
@@ -283,6 +284,7 @@ func setupWorld(t *testing.T, s *Store) *world {
 			return err
 		}
 		netlink.AddrAdd(l, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.peerIP.AsSlice()), Mask: net.CIDRMask(24, 32)}})
+		netlink.AddrAdd(l, &netlink.Addr{IPNet: &net.IPNet{IP: net.IP(w.peerIP6.AsSlice()), Mask: net.CIDRMask(64, 128)}, Flags: unix.IFA_F_NODAD})
 		netlink.LinkSetUp(l)
 		return netns.LoopbackUp()
 	})
@@ -633,19 +635,159 @@ func TestEBPFL2AntiSpoofing(t *testing.T) {
 	})
 }
 
-func TestEBPFRejectsIPv6Networks(t *testing.T) {
-	s, _ := ebpfStore(t)
-	n := &Network{Name: "v6", Subnet: netip.MustParsePrefix("10.89.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:89::/64")}
-	if err := s.Create(n); err != nil {
+// listenRemoteIn6 replies with the address the IPv6 connection came from.
+func listenRemoteIn6(t *testing.T, nsPath, addr string) {
+	t.Helper()
+	var ln net.Listener
+	err := netns.Do(nsPath, func() error {
+		var err error
+		ln, err = net.Listen("tcp6", addr)
+		return err
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	id := "6c6c6c6c6c6c6c6c"
-	ns := newNS(t, s.paths, id)
-	_, err := s.Attach(n, id, ns, 0, netip.Addr{}, true)
-	if err == nil || !strings.Contains(err.Error(), "NETKER_DATAPATH=legacy") {
-		t.Fatalf("eBPF attach to an IPv6 network: %v", err)
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			fmt.Fprint(c, c.RemoteAddr().String())
+			c.Close()
+		}
+	}()
+}
+
+// addAddr6 adds an extra address to eth0 in ns until the test ends.
+// Removing it matters: IPv6 source selection may prefer it for later
+// connections.
+func addAddr6(t *testing.T, ns string, a netip.Addr) {
+	t.Helper()
+	addr := &netlink.Addr{IPNet: hostNet(a), Flags: unix.IFA_F_NODAD}
+	onEth0 := func(fn func(netlink.Link) error) error {
+		return netns.Do(ns, func() error {
+			l, err := netlink.LinkByName("eth0")
+			if err != nil {
+				return err
+			}
+			return fn(l)
+		})
 	}
-	if links, _ := netlink.LinkList(); slices.ContainsFunc(links, func(l netlink.Link) bool { return l.Attrs().Name == HostIfName(id, 0) }) {
-		t.Fatal("netkit pair left behind after the rejected attach")
+	if err := onEth0(func(l netlink.Link) error { return netlink.AddrAdd(l, addr) }); err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { onEth0(func(l netlink.Link) error { return netlink.AddrDel(l, addr) }) })
+}
+
+func TestEBPFIPv6(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	mk := func(name, v4, v6 string, mod func(*Network)) *Network {
+		n := &Network{Name: name, Subnet: netip.MustParsePrefix(v4), Subnet6: netip.MustParsePrefix(v6)}
+		if mod != nil {
+			mod(n)
+		}
+		if err := s.Create(n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	v6 := mk("v6", "10.89.0.0/24", "fd00:89::/64", nil)
+	other := mk("v6other", "10.88.0.0/24", "fd00:88::/64", nil)
+	noicc := mk("v6noicc", "10.86.0.0/24", "fd00:86::/64", func(n *Network) { n.NoICC = true })
+	internal := mk("v6int", "10.85.0.0/24", "fd00:85::/64", func(n *Network) { n.Internal = true })
+
+	epA, nsA := attachT(t, s, v6, "a61a61a61a61a61a")
+	epB, nsB := attachT(t, s, v6, "b61b61b61b61b61b")
+	epC, nsC := attachT(t, s, other, "c61c61c61c61c61c")
+	if epA.Datapath != DatapathEBPF || !epA.IP6.IsValid() {
+		t.Fatalf("endpoint %+v", epA)
+	}
+	port := func(a netip.Addr, p uint16) string { return netip.AddrPortFrom(a, p).String() }
+
+	t.Run("container to container, redirected in BPF", func(t *testing.T) {
+		listenIn6(t, nsB, port(epB.IP6, 9000))
+		if got, err := dialIn6(nsA, port(epB.IP6, 9000)); err != nil || got != "hello over v6" {
+			dumpMetrics(t, s)
+			t.Fatalf("A->B over IPv6: %q, %v", got, err)
+		}
+		if metric(t, s, epA.HostIfIndex, "forward-local") == 0 || metric(t, s, epB.HostIfIndex, "forward-local") == 0 {
+			t.Fatal("IPv6 traffic between containers wasn't redirected in BPF both ways")
+		}
+	})
+	t.Run("other network is isolated", func(t *testing.T) {
+		listenIn6(t, nsC, port(epC.IP6, 9000))
+		before := metric(t, s, epA.HostIfIndex, "drop-policy")
+		if _, err := dialIn6(nsA, port(epC.IP6, 9000)); err == nil {
+			t.Fatal("reached a container on another network over IPv6")
+		}
+		if metric(t, s, epA.HostIfIndex, "drop-policy") == before {
+			t.Fatal("not counted as drop-policy")
+		}
+	})
+	t.Run("spoofed source is dropped", func(t *testing.T) {
+		spoof := netip.MustParseAddr("fd00:89::dead")
+		addAddr6(t, nsA, spoof)
+		before := metric(t, s, epA.HostIfIndex, "drop-spoof")
+		if _, err := dialIn6(nsA, port(epB.IP6, 9000), spoof); err == nil {
+			t.Fatal("connection from a spoofed IPv6 source succeeded")
+		}
+		if metric(t, s, epA.HostIfIndex, "drop-spoof") == before {
+			t.Fatal("not counted as drop-spoof")
+		}
+	})
+	t.Run("gateway and host stack", func(t *testing.T) {
+		listenIn6(t, "", port(epA.Gateway6, 8088))
+		if got, err := dialIn6(nsA, port(epA.Gateway6, 8088)); err != nil || got != "hello over v6" {
+			t.Fatalf("A->IPv6 gateway: %q, %v", got, err)
+		}
+	})
+	t.Run("outside world, masqueraded by the host stack", func(t *testing.T) {
+		listenRemoteIn6(t, w.ns, port(w.peerIP6, 7000))
+		got, err := dialIn6(nsA, port(w.peerIP6, 7000))
+		if err != nil {
+			dumpMetrics(t, s)
+			t.Fatalf("A->world over IPv6: %v", err)
+		}
+		if src, err := netip.ParseAddrPort(got); err != nil || src.Addr() != w.hostIP6 {
+			t.Fatalf("world saw %q, want the host's address %s", got, w.hostIP6)
+		}
+	})
+	t.Run("--icc=false", func(t *testing.T) {
+		epD, nsD := attachT(t, s, noicc, "d61d61d61d61d61d")
+		epE, nsE := attachT(t, s, noicc, "e61e61e61e61e61e")
+		listenIn6(t, nsE, port(epE.IP6, 9000))
+		if _, err := dialIn6(nsD, port(epE.IP6, 9000)); err == nil {
+			t.Fatal("--icc=false containers reached each other over IPv6")
+		}
+		if metric(t, s, epD.HostIfIndex, "drop-icc") == 0 {
+			t.Fatal("not counted as drop-icc")
+		}
+	})
+	t.Run("--internal", func(t *testing.T) {
+		epF, nsF := attachT(t, s, internal, "f61f61f61f61f61f")
+		before := metric(t, s, epF.HostIfIndex, "drop-policy")
+		if _, err := dialIn6(nsF, port(w.peerIP6, 7000)); err == nil {
+			t.Fatal("internal container reached the outside world over IPv6")
+		}
+		if metric(t, s, epF.HostIfIndex, "drop-policy") == before {
+			t.Fatal("not counted as drop-policy")
+		}
+	})
+	t.Run("detach removes the IPv6 entry", func(t *testing.T) {
+		if err := s.Detach(epB, "b61b61b61b61b61b"); err != nil {
+			t.Fatal(err)
+		}
+		eps, err := s.dp.Endpoints()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range eps {
+			if e.IP == epB.IP6 {
+				t.Fatal("IPv6 endpoint entry left after detach")
+			}
+		}
+	})
 }

@@ -509,52 +509,12 @@ func TestIPv6Legacy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	listenIn6 := func(ns, addr string) {
-		var ln net.Listener
-		listen := func() error {
-			var err error
-			ln, err = net.Listen("tcp6", addr)
-			return err
-		}
-		if ns == "" {
-			err = listen()
-		} else {
-			err = netns.Do(ns, listen)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { ln.Close() })
-		go func() {
-			for {
-				c, err := ln.Accept()
-				if err != nil {
-					return
-				}
-				fmt.Fprint(c, "hello over v6")
-				c.Close()
-			}
-		}()
-	}
-	dial6 := func(ns, addr string) (string, error) {
-		var got []byte
-		err := netns.Do(ns, func() error {
-			c, err := net.DialTimeout("tcp6", addr, 2*time.Second)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			got, err = io.ReadAll(c)
-			return err
-		})
-		return string(got), err
-	}
-	listenIn6(nsB, netip.AddrPortFrom(epB.IP6, 9000).String())
-	if got, err := dial6(nsA, netip.AddrPortFrom(epB.IP6, 9000).String()); err != nil || got != "hello over v6" {
+	listenIn6(t, nsB, netip.AddrPortFrom(epB.IP6, 9000).String())
+	if got, err := dialIn6(nsA, netip.AddrPortFrom(epB.IP6, 9000).String()); err != nil || got != "hello over v6" {
 		t.Fatalf("A->B over IPv6: %q, %v", got, err)
 	}
-	listenIn6("", netip.AddrPortFrom(epA.Gateway6, 8087).String())
-	if got, err := dial6(nsA, netip.AddrPortFrom(epA.Gateway6, 8087).String()); err != nil || got != "hello over v6" {
+	listenIn6(t, "", netip.AddrPortFrom(epA.Gateway6, 8087).String())
+	if got, err := dialIn6(nsA, netip.AddrPortFrom(epA.Gateway6, 8087).String()); err != nil || got != "hello over v6" {
 		t.Fatalf("A->IPv6 gateway: %q, %v", got, err)
 	}
 
@@ -569,4 +529,55 @@ func TestIPv6Legacy(t *testing.T) {
 	if strings.Contains(string(out), "netker:net:v6") {
 		t.Fatalf("IPv6 rules left after network rm:\n%s", out)
 	}
+}
+
+// listenIn6 is listenIn for IPv6; the server answers "hello over v6".
+func listenIn6(t *testing.T, ns, addr string) {
+	t.Helper()
+	var ln net.Listener
+	listen := func() error {
+		var err error
+		ln, err = net.Listen("tcp6", addr)
+		return err
+	}
+	var err error
+	if ns == "" {
+		err = listen()
+	} else {
+		err = netns.Do(ns, listen)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			fmt.Fprint(c, "hello over v6")
+			c.Close()
+		}
+	}()
+}
+
+// dialIn6 dials addr over IPv6 from the namespace at ns, optionally from
+// a given local address.
+func dialIn6(ns, addr string, local ...netip.Addr) (string, error) {
+	var got []byte
+	err := netns.Do(ns, func() error {
+		d := net.Dialer{Timeout: 2 * time.Second}
+		if len(local) > 0 {
+			d.LocalAddr = &net.TCPAddr{IP: net.IP(local[0].AsSlice())}
+		}
+		c, err := d.Dial("tcp6", addr)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		got, err = io.ReadAll(c)
+		return err
+	})
+	return string(got), err
 }

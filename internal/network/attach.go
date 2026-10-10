@@ -68,9 +68,6 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err != nil {
 		return nil, err
 	}
-	if n.HasIPv6() && mode == DatapathEBPF {
-		return nil, fmt.Errorf("network %s has IPv6, which the eBPF datapath doesn't handle yet; use NETKER_DATAPATH=legacy", n.Name)
-	}
 	ip, err := pool.Allocate(containerID, want)
 	if err != nil {
 		return nil, err
@@ -105,7 +102,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 		if err != nil {
 			_ = netkit.Delete(hostIf)
 			if mode == DatapathEBPF {
-				_ = s.dp.Detach(containerID, hostIf, ip)
+				_ = s.dp.Detach(containerID, hostIf, ip, ip6)
 			}
 			_ = pool.Release(ip)
 			if pool6 != nil {
@@ -158,6 +155,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if mode == DatapathEBPF {
 		err = s.dp.Attach(containerID, datapath.Endpoint{
 			IP:          ip,
+			IP6:         ip6,
 			HostIf:      ep.HostIf,
 			HostIfIndex: ep.HostIfIndex,
 			PeerIfIndex: peer.Attrs().Index,
@@ -207,7 +205,7 @@ func (s *Store) Detach(ep *Endpoint, containerID string) error {
 		errs = append(errs, err)
 	}
 	if ep.Datapath == DatapathEBPF {
-		if err := s.dp.Detach(containerID, ep.HostIf, ep.IP); err != nil {
+		if err := s.dp.Detach(containerID, ep.HostIf, ep.IP, ep.IP6); err != nil {
 			errs = append(errs, err)
 		}
 		s.dp.ForgetMetrics(ep.HostIfIndex)
