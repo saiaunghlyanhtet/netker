@@ -31,6 +31,11 @@ type netkerEndpoint struct {
 	PeerMac     [6]uint8
 }
 
+type netkerIp6Key struct {
+	_    structs.HostLayout
+	Addr [16]uint8
+}
+
 type netkerMetricsKey struct {
 	_       structs.HostLayout
 	Ifindex uint32
@@ -134,11 +139,12 @@ type netkerProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type netkerMapSpecs struct {
-	NetkerConfig    *ebpf.MapSpec `ebpf:"netker_config"`
-	NetkerEndpoints *ebpf.MapSpec `ebpf:"netker_endpoints"`
-	NetkerMetrics   *ebpf.MapSpec `ebpf:"netker_metrics"`
-	NetkerNat       *ebpf.MapSpec `ebpf:"netker_nat"`
-	NetkerPorts     *ebpf.MapSpec `ebpf:"netker_ports"`
+	NetkerConfig     *ebpf.MapSpec `ebpf:"netker_config"`
+	NetkerEndpoints  *ebpf.MapSpec `ebpf:"netker_endpoints"`
+	NetkerEndpoints6 *ebpf.MapSpec `ebpf:"netker_endpoints6"`
+	NetkerMetrics    *ebpf.MapSpec `ebpf:"netker_metrics"`
+	NetkerNat        *ebpf.MapSpec `ebpf:"netker_nat"`
+	NetkerPorts      *ebpf.MapSpec `ebpf:"netker_ports"`
 }
 
 // netkerVariableSpecs contains global variables before they are loaded into the kernel.
@@ -167,17 +173,19 @@ func (o *netkerObjects) Close() error {
 //
 // It can be passed to loadNetkerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netkerMaps struct {
-	NetkerConfig    *ebpf.Map `ebpf:"netker_config"`
-	NetkerEndpoints *ebpf.Map `ebpf:"netker_endpoints"`
-	NetkerMetrics   *ebpf.Map `ebpf:"netker_metrics"`
-	NetkerNat       *ebpf.Map `ebpf:"netker_nat"`
-	NetkerPorts     *ebpf.Map `ebpf:"netker_ports"`
+	NetkerConfig     *ebpf.Map `ebpf:"netker_config"`
+	NetkerEndpoints  *ebpf.Map `ebpf:"netker_endpoints"`
+	NetkerEndpoints6 *ebpf.Map `ebpf:"netker_endpoints6"`
+	NetkerMetrics    *ebpf.Map `ebpf:"netker_metrics"`
+	NetkerNat        *ebpf.Map `ebpf:"netker_nat"`
+	NetkerPorts      *ebpf.Map `ebpf:"netker_ports"`
 }
 
 func (m *netkerMaps) Close() error {
 	return _NetkerClose(
 		m.NetkerConfig,
 		m.NetkerEndpoints,
+		m.NetkerEndpoints6,
 		m.NetkerMetrics,
 		m.NetkerNat,
 		m.NetkerPorts,

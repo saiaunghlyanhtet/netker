@@ -36,7 +36,7 @@ sudo bin/netker run --rm --network netker --network lab alpine ip -4 addr   # et
 sudo bin/netker network connect lab web       # hot-plug eth1 into a running container
 sudo bin/netker network disconnect lab web
 sudo bin/netker network create --subnet 10.98.0.0/24 --icc=false isolated   # no container-to-container traffic
-sudo NETKER_DATAPATH=legacy bin/netker network create --subnet 10.97.0.0/24 --subnet fd00:97::/64 dual
+sudo bin/netker network create --subnet 10.97.0.0/24 --subnet fd00:97::/64 dual   # dual-stack
 
 sudo bin/netker rm -f web
 ```
@@ -89,12 +89,13 @@ go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
     address. `netker system datapath reset-host` restores the old value.
   - Netfilter is bypassed for container traffic, so host firewalls (firewalld,
     nftables policies) don't see it, as with Cilium's eBPF host routing.
-  - No IPv6 yet: networks with an IPv6 subnet are rejected; use the legacy
-    datapath for them.
-- IPv6 (legacy datapath, L3 networks): containers get an address, routes and
-  `/etc/hosts` entries, and are masqueraded by nftables. Published ports are
-  IPv4 only. Enabling IPv6 forwarding moves interfaces with `accept_ra=1` to
-  `accept_ra=2`, so the host keeps its own router-advertised addresses.
+  - IPv6 between containers is forwarded in BPF (with the same anti-spoofing,
+    isolation and `--icc` rules as IPv4), but IPv6 to and from the outside
+    still goes through the host stack and nftables masquerade.
+- IPv6 (L3 networks only): containers get an address, routes and `/etc/hosts`
+  entries. Published ports are IPv4 only. Enabling IPv6 forwarding moves
+  interfaces with `accept_ra=1` to `accept_ra=2`, so the host keeps its own
+  router-advertised addresses.
 - Legacy datapath: published ports aren't reachable through `127.0.0.1`.
 - There is no shim yet, so exit codes of detached containers aren't recorded, and
   `--rm` only works for foreground runs.

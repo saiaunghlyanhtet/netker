@@ -25,6 +25,20 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } netker_endpoints SEC(".maps");
 
+/* An IPv6 address as a map key. */
+struct ip6_key {
+	__u8 addr[16];
+};
+
+/* Container IPv6 address -> endpoint, for networks with an IPv6 subnet. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct ip6_key);
+	__type(value, struct endpoint);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_endpoints6 SEC(".maps");
+
 struct metrics_key {
 	__u32 ifindex; /* primary ifindex of the endpoint */
 	__u8 dir;
