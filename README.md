@@ -89,13 +89,16 @@ go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
     address. `netker system datapath reset-host` restores the old value.
   - Netfilter is bypassed for container traffic, so host firewalls (firewalld,
     nftables policies) don't see it, as with Cilium's eBPF host routing.
-  - IPv6 between containers is forwarded in BPF (with the same anti-spoofing,
-    isolation and `--icc` rules as IPv4), but IPv6 to and from the outside
-    still goes through the host stack and nftables masquerade.
+  - IPv6 packets with extension headers aren't translated in BPF; they fall
+    back to the host stack and nftables masquerade.
 - IPv6 (L3 networks only): containers get an address, routes and `/etc/hosts`
-  entries. Published ports are IPv4 only. Enabling IPv6 forwarding moves
-  interfaces with `accept_ra=1` to `accept_ra=2`, so the host keeps its own
-  router-advertised addresses.
+  entries. On the eBPF datapath IPv6 is forwarded, masqueraded (NAT66) and
+  published like IPv4: `-p 8080:80` listens on IPv4 and, for dual-stack
+  containers, IPv6 (including `[::1]`); `-p [::1]:8080:80` picks one address.
+  The legacy datapath forwards IPv6 through the host stack and publishes
+  ports on IPv4 only. Enabling IPv6 forwarding moves interfaces with
+  `accept_ra=1` to `accept_ra=2`, so the host keeps its own router-advertised
+  addresses.
 - Legacy datapath: published ports aren't reachable through `127.0.0.1`.
 - There is no shim yet, so exit codes of detached containers aren't recorded, and
   `--rm` only works for foreground runs.

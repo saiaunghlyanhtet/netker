@@ -27,44 +27,71 @@ func protoNum(p string) (uint8, error) {
 	return 0, fmt.Errorf("unsupported protocol %q", p)
 }
 
-func portKey(p Port) (netkerPortKey, error) {
+// portKeys returns the map keys a published port needs. Like Docker, a
+// port without a host IP is published on IPv4 and, if the container has
+// IPv6, on IPv6; 0.0.0.0 and [::] pick one family.
+func portKeys(p Port, hasIPv6 bool) (k4 *netkerPortKey, k6 *netkerPort6Key, err error) {
 	proto, err := protoNum(p.Protocol)
 	if err != nil {
-		return netkerPortKey{}, err
+		return nil, nil, err
 	}
-	k := netkerPortKey{Port: be16(p.HostPort), Proto: proto}
-	if p.HostIP.IsValid() && !p.HostIP.IsUnspecified() {
-		if !p.HostIP.Is4() {
-			return k, fmt.Errorf("host IP %s: only IPv4 is supported", p.HostIP)
+	v4 := !p.HostIP.IsValid() || p.HostIP.Is4()
+	v6 := (!p.HostIP.IsValid() && hasIPv6) || (p.HostIP.IsValid() && p.HostIP.Is6())
+	if p.HostIP.IsValid() && p.HostIP.Is6() && !hasIPv6 {
+		return nil, nil, fmt.Errorf("host IP %s: the container has no IPv6 address", p.HostIP)
+	}
+	if v4 {
+		k4 = &netkerPortKey{Port: be16(p.HostPort), Proto: proto}
+		if p.HostIP.IsValid() && !p.HostIP.IsUnspecified() {
+			k4.Addr = be32(p.HostIP)
 		}
-		k.Addr = be32(p.HostIP)
 	}
-	return k, nil
+	if v6 {
+		k6 = &netkerPort6Key{Port: be16(p.HostPort), Proto: proto}
+		if p.HostIP.IsValid() && !p.HostIP.IsUnspecified() {
+			k6.Addr = p.HostIP.As16()
+		}
+	}
+	return k4, k6, nil
 }
 
-// Publish maps each host port to the container. A port that's already
-// published fails, like Docker's "port is already allocated".
-func (d *Datapath) Publish(ctrIP netip.Addr, ifindex int, ports []Port) (err error) {
+// Publish maps each host port to the container (ctrIP6 may be the zero
+// Addr). A port that's already published fails, like Docker's "port is
+// already allocated".
+func (d *Datapath) Publish(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port) (err error) {
 	if err := d.EnsureHost(); err != nil {
 		return err
 	}
 	var done []Port
 	defer func() {
 		if err != nil {
-			d.Unpublish(ctrIP, done)
+			d.Unpublish(ctrIP, ctrIP6, done)
 		}
 	}()
+	taken := func(p Port, err error) error {
+		if errors.Is(err, ebpf.ErrKeyExist) {
+			return fmt.Errorf("port %d/%s is already allocated", p.HostPort, p.Protocol)
+		}
+		return err
+	}
 	for _, p := range ports {
-		k, err := portKey(p)
+		k4, k6, err := portKeys(p, ctrIP6.IsValid())
 		if err != nil {
 			return err
 		}
-		v := netkerPortVal{CtrAddr: be32(ctrIP), CtrPort: be16(p.ContainerPort), Ifindex: uint32(ifindex)}
-		if err := d.objs.NetkerPorts.Update(k, v, ebpf.UpdateNoExist); err != nil {
-			if errors.Is(err, ebpf.ErrKeyExist) {
-				return fmt.Errorf("port %d/%s is already allocated", p.HostPort, p.Protocol)
+		if k4 != nil {
+			v := netkerPortVal{CtrAddr: be32(ctrIP), CtrPort: be16(p.ContainerPort), Ifindex: uint32(ifindex)}
+			if err := d.objs.NetkerPorts.Update(k4, v, ebpf.UpdateNoExist); err != nil {
+				return taken(p, err)
 			}
-			return err
+		}
+		if k6 != nil {
+			v := netkerPort6Val{CtrAddr: ctrIP6.As16(), CtrPort: be16(p.ContainerPort), Ifindex: uint32(ifindex)}
+			if err := d.objs.NetkerPorts6.Update(k6, v, ebpf.UpdateNoExist); err != nil {
+				// The IPv4 half is in place; roll it back with this port.
+				done = append(done, p)
+				return taken(p, err)
+			}
 		}
 		done = append(done, p)
 	}
@@ -73,25 +100,27 @@ func (d *Datapath) Publish(ctrIP netip.Addr, ifindex int, ports []Port) (err err
 
 // Unpublish removes the container's entries; entries owned by another
 // container are left alone.
-func (d *Datapath) Unpublish(ctrIP netip.Addr, ports []Port) error {
+func (d *Datapath) Unpublish(ctrIP, ctrIP6 netip.Addr, ports []Port) error {
 	if err := d.Load(); err != nil {
 		return err
 	}
 	var errs []error
 	for _, p := range ports {
-		k, err := portKey(p)
+		k4, k6, err := portKeys(p, ctrIP6.IsValid())
 		if err != nil {
 			continue
 		}
-		var v netkerPortVal
-		if err := d.objs.NetkerPorts.Lookup(k, &v); err != nil {
-			continue
+		var v4 netkerPortVal
+		if k4 != nil && d.objs.NetkerPorts.Lookup(k4, &v4) == nil && v4.CtrAddr == be32(ctrIP) {
+			if err := d.objs.NetkerPorts.Delete(k4); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				errs = append(errs, err)
+			}
 		}
-		if v.CtrAddr != be32(ctrIP) {
-			continue
-		}
-		if err := d.objs.NetkerPorts.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			errs = append(errs, err)
+		var v6 netkerPort6Val
+		if k6 != nil && d.objs.NetkerPorts6.Lookup(k6, &v6) == nil && v6.CtrAddr == ctrIP6.As16() {
+			if err := d.objs.NetkerPorts6.Delete(k6); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -127,7 +156,22 @@ func (d *Datapath) Ports() ([]PortEntry, error) {
 		}
 		out = append(out, e)
 	}
-	return out, it.Err()
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	var k6 netkerPort6Key
+	var v6 netkerPort6Val
+	it6 := d.objs.NetkerPorts6.Iterate()
+	for it6.Next(&k6, &v6) {
+		out = append(out, PortEntry{
+			HostIP:        netip.AddrFrom16(k6.Addr).String(),
+			HostPort:      portFromBE16(k6.Port),
+			Protocol:      map[uint8]string{unix.IPPROTO_TCP: "tcp", unix.IPPROTO_UDP: "udp"}[k6.Proto],
+			ContainerIP:   netip.AddrFrom16(v6.CtrAddr),
+			ContainerPort: portFromBE16(v6.CtrPort),
+		})
+	}
+	return out, it6.Err()
 }
 
 // NATEntries counts the connection-tracking entries.
@@ -142,5 +186,14 @@ func (d *Datapath) NATEntries() (int, error) {
 	for it.Next(&k, &v) {
 		n++
 	}
-	return n, it.Err()
+	if err := it.Err(); err != nil {
+		return n, err
+	}
+	var k6 netkerNat6Key
+	var v6 netkerNat6Val
+	it6 := d.objs.NetkerNat6.Iterate()
+	for it6.Next(&k6, &v6) {
+		n++
+	}
+	return n, it6.Err()
 }

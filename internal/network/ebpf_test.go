@@ -3,17 +3,20 @@ package network
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
@@ -35,8 +38,13 @@ func ebpfStore(t *testing.T) (*Store, string) {
 	t.Setenv("NETKER_BPFFS", bpffs)
 	t.Setenv("NETKER_DATAPATH", "ebpf")
 	s, _ := testStore(t)
+	if !inInitUserNS() {
+		t.Skip("loading BPF needs root in the initial user namespace")
+	}
+	// As real root a load failure is a bug (e.g. the verifier rejecting a
+	// program), not a reason to skip.
 	if err := s.dp.Load(); err != nil {
-		t.Skipf("eBPF datapath not loadable here: %v", err)
+		t.Fatalf("load eBPF datapath: %v", err)
 	}
 	t.Cleanup(func() {
 		s.dp.ResetHost()
@@ -297,6 +305,12 @@ func setupWorld(t *testing.T, s *Store) *world {
 func dropNFT(t *testing.T) {
 	t.Helper()
 	exec.Command("nft", "delete", "table", "ip", "netker").Run()
+}
+
+// dropNFT6 is dropNFT for the IPv6 table.
+func dropNFT6(t *testing.T) {
+	t.Helper()
+	exec.Command("nft", "delete", "table", "ip6", "netker").Run()
 }
 
 // listenRemoteIn replies with the address the connection came from.
@@ -744,15 +758,19 @@ func TestEBPFIPv6(t *testing.T) {
 			t.Fatalf("A->IPv6 gateway: %q, %v", got, err)
 		}
 	})
-	t.Run("outside world, masqueraded by the host stack", func(t *testing.T) {
+	t.Run("outside world, masqueraded in BPF", func(t *testing.T) {
+		dropNFT6(t)
 		listenRemoteIn6(t, w.ns, port(w.peerIP6, 7000))
 		got, err := dialIn6(nsA, port(w.peerIP6, 7000))
 		if err != nil {
 			dumpMetrics(t, s)
 			t.Fatalf("A->world over IPv6: %v", err)
 		}
-		if src, err := netip.ParseAddrPort(got); err != nil || src.Addr() != w.hostIP6 {
-			t.Fatalf("world saw %q, want the host's address %s", got, w.hostIP6)
+		if src, err := netip.ParseAddrPort(got); err != nil || src.Addr() != w.hostIP6 || src.Port() < 61000 {
+			t.Fatalf("world saw %q, want the host's address %s with a NAT port >= 61000", got, w.hostIP6)
+		}
+		if metric(t, s, epA.HostIfIndex, "snat") == 0 || metric(t, s, epA.HostIfIndex, "rev-snat") == 0 {
+			t.Fatal("IPv6 to the world wasn't masqueraded in BPF")
 		}
 	})
 	t.Run("--icc=false", func(t *testing.T) {
@@ -790,4 +808,149 @@ func TestEBPFIPv6(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestEBPFIPv6PublishedPorts(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n := &Network{Name: "v6p", Subnet: netip.MustParsePrefix("10.84.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:84::/64")}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	epA, nsA := attachT(t, s, n, "a62a62a62a62a62a")
+	epB, nsB := attachT(t, s, n, "b62b62b62b62b62b")
+	listenIn6(t, nsB, netip.AddrPortFrom(epB.IP6, 80).String())
+	listenIn(t, nsB, epB.IP.String()+":80")
+	ports := []PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	if err := s.Publish("b62b62b62b62b62b", epB, ports); err != nil {
+		t.Fatal(err)
+	}
+	dropNFT(t)
+	dropNFT6(t)
+	hostPort6 := netip.AddrPortFrom(w.hostIP6, 8080).String()
+
+	t.Run("published on both families", func(t *testing.T) {
+		entries, err := s.dp.Ports()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hosts []string
+		for _, e := range entries {
+			hosts = append(hosts, e.HostIP)
+		}
+		if len(entries) != 2 || !slices.Contains(hosts, "0.0.0.0") || !slices.Contains(hosts, "::") {
+			t.Fatalf("published entries %+v", entries)
+		}
+	})
+	t.Run("from the world over IPv6", func(t *testing.T) {
+		if got, err := dialIn6(w.ns, hostPort6); err != nil || got != "hello over v6" {
+			dumpMetrics(t, s)
+			t.Fatalf("%q, %v", got, err)
+		}
+		if metric(t, s, epB.HostIfIndex, "dnat") == 0 || metric(t, s, epB.HostIfIndex, "rev-dnat") == 0 {
+			t.Fatal("IPv6 published port not translated in BPF")
+		}
+	})
+	t.Run("from the world over IPv4 still works", func(t *testing.T) {
+		if got, err := dialIn(w.ns, w.hostIP.String()+":8080"); err != nil || got != "hello from netker" {
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("from the host via [::1]", func(t *testing.T) {
+		var got []byte
+		c, err := net.DialTimeout("tcp6", "[::1]:8080", 2*time.Second)
+		if err == nil {
+			got, err = io.ReadAll(c)
+			c.Close()
+		}
+		if err != nil || string(got) != "hello over v6" {
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("from the host via its own IPv6 address", func(t *testing.T) {
+		var got []byte
+		c, err := net.DialTimeout("tcp6", hostPort6, 2*time.Second)
+		if err == nil {
+			got, err = io.ReadAll(c)
+			c.Close()
+		}
+		if err != nil || string(got) != "hello over v6" {
+			dumpMetrics(t, s)
+			t.Fatalf("%q, %v", got, err)
+		}
+	})
+	t.Run("hairpin from another container", func(t *testing.T) {
+		before := metric(t, s, epA.HostIfIndex, "dnat")
+		if got, err := dialIn6(nsA, hostPort6); err != nil || got != "hello over v6" {
+			t.Fatalf("%q, %v", got, err)
+		}
+		if metric(t, s, epA.HostIfIndex, "dnat") == before {
+			t.Fatal("IPv6 hairpin not translated in BPF")
+		}
+	})
+	t.Run("container's own [::1] is untouched", func(t *testing.T) {
+		if _, err := dialIn6(nsA, "[::1]:8080"); err == nil {
+			t.Fatal("[::1] inside a container was redirected")
+		}
+	})
+	t.Run("unpublish removes both families", func(t *testing.T) {
+		if err := s.Unpublish("b62b62b62b62b62b", []*Endpoint{epB}, ports); err != nil {
+			t.Fatal(err)
+		}
+		if entries, _ := s.dp.Ports(); len(entries) != 0 {
+			t.Fatalf("entries left: %+v", entries)
+		}
+		if _, err := dialIn6(w.ns, hostPort6); err == nil {
+			t.Fatal("IPv6 port still reachable after unpublish")
+		}
+	})
+}
+
+func TestEBPFPing6ThroughNAT(t *testing.T) {
+	s, _ := ebpfStore(t)
+	w := setupWorld(t, s)
+	n := &Network{Name: "v6ping", Subnet: netip.MustParsePrefix("10.83.0.0/24"), Subnet6: netip.MustParsePrefix("fd00:83::/64")}
+	if err := s.Create(n); err != nil {
+		t.Fatal(err)
+	}
+	ep, ns := attachT(t, s, n, "a63a63a63a63a63a")
+	dropNFT6(t)
+	err := netns.Do(ns, func() error {
+		c, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		msg := icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Body: &icmp.Echo{ID: 4343, Seq: 1, Data: []byte("netker")}}
+		b, _ := msg.Marshal(nil) // the kernel fills in the ICMPv6 checksum
+		if _, err := c.WriteTo(b, &net.IPAddr{IP: net.IP(w.peerIP6.AsSlice())}); err != nil {
+			return err
+		}
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := c.ReadFrom(buf)
+			if err != nil {
+				return fmt.Errorf("no echo reply: %w", err)
+			}
+			m, err := icmp.ParseMessage(58, buf[:n])
+			if err != nil || m.Type != ipv6.ICMPTypeEchoReply {
+				continue
+			}
+			if e := m.Body.(*icmp.Echo); e.ID != 4343 {
+				return fmt.Errorf("reply id %d, want the original 4343", e.ID)
+			}
+			if from.String() != w.peerIP6.String() {
+				return fmt.Errorf("reply from %s", from)
+			}
+			return nil
+		}
+	})
+	if err != nil {
+		dumpMetrics(t, s)
+		t.Fatal(err)
+	}
+	if metric(t, s, ep.HostIfIndex, "rev-snat") == 0 {
+		t.Fatal("ICMPv6 echo reply was not un-masqueraded in BPF")
+	}
 }

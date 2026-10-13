@@ -2,6 +2,7 @@ package network
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
@@ -15,9 +16,14 @@ func (s *Store) Publish(containerID string, ep *Endpoint, ports []PortMapping) e
 		return nil
 	}
 	if ep.Datapath != DatapathEBPF {
+		for _, p := range ports {
+			if a, err := netip.ParseAddr(p.HostIP); err == nil && a.Is6() {
+				return fmt.Errorf("-p %s: publishing on IPv6 needs the eBPF datapath", p)
+			}
+		}
 		return PublishPorts(containerID, ep.IP.String(), ports)
 	}
-	return s.dp.Publish(ep.IP, ep.HostIfIndex, bpfPorts(ports))
+	return s.dp.Publish(ep.IP, ep.IP6, ep.HostIfIndex, bpfPorts(ports))
 }
 
 // Unpublish removes what Publish installed.
@@ -28,7 +34,7 @@ func (s *Store) Unpublish(containerID string, eps []*Endpoint, ports []PortMappi
 	var errs []error
 	for _, ep := range eps {
 		if ep.Datapath == DatapathEBPF {
-			errs = append(errs, s.dp.Unpublish(ep.IP, bpfPorts(ports)))
+			errs = append(errs, s.dp.Unpublish(ep.IP, ep.IP6, bpfPorts(ports)))
 		}
 	}
 	errs = append(errs, UnpublishPorts(containerID))

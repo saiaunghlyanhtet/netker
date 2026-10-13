@@ -96,12 +96,25 @@ func parsePort(s string) (network.PortMapping, error) {
 		}
 		pm.Protocol = proto
 	}
+	// An IPv6 host address is written in brackets: [::1]:8080:80.
+	if rest, ok := strings.CutPrefix(spec, "["); ok {
+		ip, ports, ok := strings.Cut(rest, "]:")
+		a, err := netip.ParseAddr(ip)
+		if !ok || err != nil || !a.Is6() {
+			return pm, fmt.Errorf("invalid IPv6 host address in %q", s)
+		}
+		pm.HostIP = a.String()
+		spec = ports
+	}
 	parts := strings.Split(spec, ":")
+	if pm.HostIP != "" && len(parts) != 2 {
+		return pm, fmt.Errorf("invalid port mapping %q: use [ip:]hostPort:containerPort[/proto]", s)
+	}
 	switch len(parts) {
 	case 2:
 	case 3:
-		if _, err := netip.ParseAddr(parts[0]); err != nil {
-			return pm, fmt.Errorf("invalid host IP in %q", s)
+		if a, err := netip.ParseAddr(parts[0]); err != nil || !a.Is4() {
+			return pm, fmt.Errorf("invalid host IP in %q (IPv6 addresses go in brackets)", s)
 		}
 		pm.HostIP = parts[0]
 		parts = parts[1:]

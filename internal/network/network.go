@@ -54,8 +54,9 @@ type Network struct {
 func (n *Network) HasIPv6() bool { return n.Subnet6.IsValid() }
 
 type Store struct {
-	paths config.Paths
-	dp    *datapath.Datapath
+	paths          config.Paths
+	dp             *datapath.Datapath
+	warnedFallback bool
 }
 
 func NewStore(p config.Paths) *Store {

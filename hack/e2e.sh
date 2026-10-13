@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-v6a >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-v6a e2e-v6web >/dev/null 2>&1 || true
 	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
 		netker network rm "$n" >/dev/null 2>&1 || true
 	done
@@ -173,6 +173,16 @@ expect "ipv6: ping a peer by name over IPv6" "1 packets received" "$(echo "$out"
 expect "ipv6: ping the IPv6 gateway" "1 packets received" "$(echo "$out" | grep -A5 'PING fd00:89::1')"
 if [[ "$datapath" == ebpf ]]; then
 	expect "ipv6: eBPF endpoint map has the IPv6 address" "fd00:89::" "$(netker system datapath status)"
+	netker run -d --name e2e-v6web --network e2e-v6 -p 8086:80 alpine sh -c \
+		'while true; do printf "HTTP/1.0 200 OK\r\n\r\nv6web\n" | nc -l -p 80; done' >/dev/null
+	sleep 0.5
+	expect "ipv6: port published on both families" ":::8086/tcp" "$(netker system datapath status)"
+	expect "ipv6: published port on [::1]" "v6web" "$(curl -s -6 --max-time 3 'http://[::1]:8086/')"
+	expect "ipv6: same port on 127.0.0.1" "v6web" "$(curl -s --max-time 3 http://127.0.0.1:8086/)"
+	netker rm -f e2e-v6web >/dev/null
+else
+	expect "ipv6: legacy datapath rejects IPv6 host addresses in -p" "needs the eBPF datapath" \
+		"$(netker run --rm --network e2e-v6 -p '[::1]:8087:80' alpine true 2>&1 || true)"
 fi
 netker rm -f e2e-v6a >/dev/null
 netker network rm e2e-v6 >/dev/null

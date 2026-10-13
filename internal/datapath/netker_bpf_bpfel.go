@@ -50,6 +50,25 @@ type netkerMetricsVal struct {
 	Bytes   uint64
 }
 
+type netkerNat6Key struct {
+	_     structs.HostLayout
+	Saddr [16]uint8
+	Daddr [16]uint8
+	Sport uint16
+	Dport uint16
+	Proto uint8
+	Dir   uint8
+	Pad   uint16
+}
+
+type netkerNat6Val struct {
+	_       structs.HostLayout
+	Addr    [16]uint8
+	Port    uint16
+	Pad     uint16
+	Ifindex uint32
+}
+
 type netkerNatKey struct {
 	_     structs.HostLayout
 	Saddr uint32
@@ -68,6 +87,22 @@ type netkerNatVal struct {
 	Pad     uint16
 	Ifindex uint32
 	Pad2    uint32
+}
+
+type netkerPort6Key struct {
+	_     structs.HostLayout
+	Addr  [16]uint8
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type netkerPort6Val struct {
+	_       structs.HostLayout
+	CtrAddr [16]uint8
+	CtrPort uint16
+	Pad     uint16
+	Ifindex uint32
 }
 
 type netkerPortKey struct {
@@ -132,6 +167,7 @@ type netkerProgramSpecs struct {
 	NkFromLo        *ebpf.ProgramSpec `ebpf:"nk_from_lo"`
 	NkFromWorld     *ebpf.ProgramSpec `ebpf:"nk_from_world"`
 	NkSockConnect4  *ebpf.ProgramSpec `ebpf:"nk_sock_connect4"`
+	NkSockConnect6  *ebpf.ProgramSpec `ebpf:"nk_sock_connect6"`
 	NkToContainer   *ebpf.ProgramSpec `ebpf:"nk_to_container"`
 }
 
@@ -144,7 +180,9 @@ type netkerMapSpecs struct {
 	NetkerEndpoints6 *ebpf.MapSpec `ebpf:"netker_endpoints6"`
 	NetkerMetrics    *ebpf.MapSpec `ebpf:"netker_metrics"`
 	NetkerNat        *ebpf.MapSpec `ebpf:"netker_nat"`
+	NetkerNat6       *ebpf.MapSpec `ebpf:"netker_nat6"`
 	NetkerPorts      *ebpf.MapSpec `ebpf:"netker_ports"`
+	NetkerPorts6     *ebpf.MapSpec `ebpf:"netker_ports6"`
 }
 
 // netkerVariableSpecs contains global variables before they are loaded into the kernel.
@@ -178,7 +216,9 @@ type netkerMaps struct {
 	NetkerEndpoints6 *ebpf.Map `ebpf:"netker_endpoints6"`
 	NetkerMetrics    *ebpf.Map `ebpf:"netker_metrics"`
 	NetkerNat        *ebpf.Map `ebpf:"netker_nat"`
+	NetkerNat6       *ebpf.Map `ebpf:"netker_nat6"`
 	NetkerPorts      *ebpf.Map `ebpf:"netker_ports"`
+	NetkerPorts6     *ebpf.Map `ebpf:"netker_ports6"`
 }
 
 func (m *netkerMaps) Close() error {
@@ -188,7 +228,9 @@ func (m *netkerMaps) Close() error {
 		m.NetkerEndpoints6,
 		m.NetkerMetrics,
 		m.NetkerNat,
+		m.NetkerNat6,
 		m.NetkerPorts,
+		m.NetkerPorts6,
 	)
 }
 
@@ -206,6 +248,7 @@ type netkerPrograms struct {
 	NkFromLo        *ebpf.Program `ebpf:"nk_from_lo"`
 	NkFromWorld     *ebpf.Program `ebpf:"nk_from_world"`
 	NkSockConnect4  *ebpf.Program `ebpf:"nk_sock_connect4"`
+	NkSockConnect6  *ebpf.Program `ebpf:"nk_sock_connect6"`
 	NkToContainer   *ebpf.Program `ebpf:"nk_to_container"`
 }
 
@@ -215,6 +258,7 @@ func (p *netkerPrograms) Close() error {
 		p.NkFromLo,
 		p.NkFromWorld,
 		p.NkSockConnect4,
+		p.NkSockConnect6,
 		p.NkToContainer,
 	)
 }
