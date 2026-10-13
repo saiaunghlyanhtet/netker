@@ -66,7 +66,7 @@ func datapathStatusCmd() *cobra.Command {
 					state = "defunct"
 				}
 				dev := h.Device
-				if h.Kind == "connect4" {
+				if h.Kind == "connect4" || h.Kind == "connect6" {
 					dev = "(root cgroup)"
 				}
 				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\n", h.Kind, dev, h.ProgramID, state)

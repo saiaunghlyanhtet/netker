@@ -30,8 +30,8 @@ func (d *Datapath) uplinkPin(ifname string) string {
 	return filepath.Join(d.hostDir(), "uplink-"+ifname)
 }
 
-func (d *Datapath) connectPin() string  { return filepath.Join(d.hostDir(), "connect4") }
-func (d *Datapath) loopbackPin() string { return filepath.Join(d.hostDir(), "loopback") }
+func (d *Datapath) connectPin(kind string) string { return filepath.Join(d.hostDir(), kind) }
+func (d *Datapath) loopbackPin() string           { return filepath.Join(d.hostDir(), "loopback") }
 
 // be32 returns addr as the uint32 whose in-memory bytes are in network order,
 // which is how the BPF side's __be32 fields read it.
@@ -95,7 +95,10 @@ func (d *Datapath) EnsureHost() error {
 			return err
 		}
 	}
-	return d.attachConnect4()
+	if err := d.attachConnect("connect4", ebpf.AttachCGroupInet4Connect, d.objs.NkSockConnect4); err != nil {
+		return err
+	}
+	return d.attachConnect("connect6", ebpf.AttachCGroupInet6Connect, d.objs.NkSockConnect6)
 }
 
 func (d *Datapath) writeConfig() error {
@@ -234,27 +237,29 @@ func (d *Datapath) attachTCX(l netlink.Link, pin string, prog *ebpf.Program) err
 	return tl.Pin(pin)
 }
 
-func (d *Datapath) attachConnect4() error {
-	if l, err := link.LoadPinnedLink(d.connectPin(), nil); err == nil {
+// attachConnect hooks connect() on the root cgroup for loopback published
+// ports (kind connect4 for 127.0.0.0/8, connect6 for [::1]).
+func (d *Datapath) attachConnect(kind string, typ ebpf.AttachType, prog *ebpf.Program) error {
+	if l, err := link.LoadPinnedLink(d.connectPin(kind), nil); err == nil {
 		l.Close()
 		return nil
 	}
 	cl, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    cgroupRoot(),
-		Attach:  ebpf.AttachCGroupInet4Connect,
-		Program: d.objs.NkSockConnect4,
+		Attach:  typ,
+		Program: prog,
 	})
 	if err != nil {
-		return fmt.Errorf("attach connect4 hook to %s: %w", cgroupRoot(), err)
+		return fmt.Errorf("attach %s hook to %s: %w", kind, cgroupRoot(), err)
 	}
 	defer cl.Close()
-	return cl.Pin(d.connectPin())
+	return cl.Pin(d.connectPin(kind))
 }
 
 // HostLink describes a pinned host-wide link.
 type HostLink struct {
 	Pin       string `json:"pin"`
-	Kind      string `json:"kind"` // uplink, loopback or connect4
+	Kind      string `json:"kind"` // uplink, loopback, connect4 or connect6
 	Device    string `json:"device,omitempty"`
 	ProgramID uint32 `json:"program_id"`
 	Defunct   bool   `json:"defunct"`

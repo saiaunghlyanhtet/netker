@@ -254,6 +254,21 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 			entries++
 		}
 	}
+	var pk6 netkerPort6Key
+	var pv6 netkerPort6Val
+	var stalePorts6 []netkerPort6Key
+	pit6 := d.objs.NetkerPorts6.Iterate()
+	for pit6.Next(&pk6, &pv6) {
+		var ep netkerEndpoint
+		if d.objs.NetkerEndpoints6.Lookup(netkerIp6Key{Addr: pv6.CtrAddr}, &ep) != nil {
+			stalePorts6 = append(stalePorts6, pk6)
+		}
+	}
+	for _, k := range stalePorts6 {
+		if d.objs.NetkerPorts6.Delete(k) == nil {
+			entries++
+		}
+	}
 	// Uplink links of interfaces that disappeared.
 	hls, _ := d.HostLinks()
 	for _, hl := range hls {
@@ -388,6 +403,8 @@ func (d *Datapath) Upgrade() (int, error) {
 		switch hl.Kind {
 		case "connect4":
 			prog = d.objs.NkSockConnect4
+		case "connect6":
+			prog = d.objs.NkSockConnect6
 		case "loopback":
 			prog = d.objs.NkFromLo
 		}

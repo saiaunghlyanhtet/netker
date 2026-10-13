@@ -188,8 +188,16 @@ func (s *Store) datapathMode() (string, error) {
 		}
 		return DatapathEBPF, nil
 	case "auto":
-		if s.dp.Load() == nil {
+		err := s.dp.Load()
+		if err == nil {
 			return DatapathEBPF, nil
+		}
+		// Unprivileged (or root in a user namespace) the fallback is
+		// expected. As real root it hides a real problem, such as the
+		// verifier rejecting a program, so say so.
+		if os.Geteuid() == 0 && !s.warnedFallback && inInitUserNS() {
+			fmt.Fprintf(os.Stderr, "warning: eBPF datapath unavailable, using the legacy datapath: %v\n", err)
+			s.warnedFallback = true
 		}
 		return DatapathLegacy, nil
 	default:
@@ -470,4 +478,15 @@ func (s *Store) SetDefaultRoute(nsPath string, ep *Endpoint) error {
 	}
 	ep.Default = true
 	return nil
+}
+
+// inInitUserNS reports whether netker runs in the initial user namespace,
+// where root can load BPF.
+func inInitUserNS() bool {
+	b, err := os.ReadFile("/proc/self/uid_map")
+	if err != nil {
+		return false
+	}
+	f := strings.Fields(string(b))
+	return len(f) == 3 && f[0] == "0" && f[1] == "0" && f[2] == "4294967295"
 }

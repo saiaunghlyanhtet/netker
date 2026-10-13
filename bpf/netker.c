@@ -21,6 +21,7 @@
 #include "lib/maps.h"
 #include "lib/l4.h"
 #include "lib/nat.h"
+#include "lib/nat6.h"
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -114,19 +115,19 @@ static __always_inline bool ip6_is_mcast(const struct in6_addr *a)
 	return a->in6_u.u6_addr8[0] == 0xff;
 }
 
-static __always_inline void ip6_copy(__u32 *dst, const struct in6_addr *a)
-{
-	__builtin_memcpy(dst, a->in6_u.u6_addr32, 16);
-}
-
-/* from_container6 is nk_from_container for IPv6: the same anti-spoofing,
- * isolation and local redirect as IPv4. Everything that leaves the host
- * goes through the host stack for now, where nftables masquerades it.
+/* from_container6 is nk_from_container for IPv6, with the same steps:
+ * anti-spoofing, replies from published ports, isolation and local
+ * redirect, published-port hairpin, and SNAT66 to an uplink. It's a
+ * separate BPF function (not inlined) because the IPv6 NAT keys don't fit
+ * the 512-byte stack next to the IPv4 path.
  */
-static __always_inline int from_container6(struct __sk_buff *skb, struct ethhdr *eth, __u32 self)
+static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u32 self)
 {
+	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
 	struct ipv6hdr *ip6 = (void *)(eth + 1);
+	struct l4 l = {};
 
 	if ((void *)(ip6 + 1) > data_end) {
 		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
@@ -137,11 +138,11 @@ static __always_inline int from_container6(struct __sk_buff *skb, struct ethhdr 
 		count(self, DIR_EGRESS, REASON_DROP_MCAST, skb->len);
 		return NETKIT_DROP;
 	}
-	struct ip6_key skey, dkey;
-	__builtin_memcpy(skey.addr, &ip6->saddr, 16);
-	__builtin_memcpy(dkey.addr, &ip6->daddr, 16);
+	__u8 saddr[16], daddr[16];
+	__builtin_memcpy(saddr, &ip6->saddr, 16);
+	__builtin_memcpy(daddr, &ip6->daddr, 16);
 
-	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints6, &skey);
+	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints6, saddr);
 	if (!src || src->ifindex != self) {
 		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
 		return NETKIT_DROP;
@@ -152,34 +153,132 @@ static __always_inline int from_container6(struct __sk_buff *skb, struct ethhdr 
 	}
 	__u32 src_netid = src->netid;
 	__u32 src_flags = src->flags;
+	bool has_l4 = parse_l4_6(skb, ip6, &l);
+	bool rev_dnat = false;
 
-	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, &dkey);
+	/* A reply from a published port: restore the address the client used. */
+	if (has_l4) {
+		struct nat6_key k = { .sport = l.sport, .dport = l.dport, .proto = l.proto, .dir = NAT_DNAT_REPLY };
+		__builtin_memcpy(k.saddr, saddr, 16);
+		__builtin_memcpy(k.daddr, daddr, 16);
+		struct nat6_val *v = bpf_map_lookup_elem(&netker_nat6, &k);
+		if (v) {
+			__u8 orig[16];
+			__be16 orig_port = v->port;
+			__builtin_memcpy(orig, v->addr, 16);
+			if (rewrite_port(skb, &l, true, l.sport, orig_port) < 0 ||
+			    rewrite_addr6(skb, &l, true, saddr, orig) < 0) {
+				count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+				return NETKIT_DROP;
+			}
+			__builtin_memcpy(saddr, orig, 16);
+			l.sport = orig_port;
+			rev_dnat = true;
+		}
+	}
+
+	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, daddr);
 	if (dst) {
-		if (dst->netid != src_netid) {
+		if (!rev_dnat && dst->netid != src_netid) {
 			count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
 			return NETKIT_DROP;
 		}
-		if (src_flags & EP_F_NO_ICC) {
+		if (!rev_dnat && (src_flags & EP_F_NO_ICC)) {
 			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
 			return NETKIT_DROP;
 		}
-		return to_local(skb, self, dst, REASON_FORWARD_LOCAL, true);
+		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL, true);
 	}
 
 	struct bpf_fib_lookup fib = {
 		.family = AF_INET6,
 		.ifindex = self,
 	};
-	ip6_copy(fib.ipv6_src, &ip6->saddr);
-	ip6_copy(fib.ipv6_dst, &ip6->daddr);
-	long rc = bpf_fib_lookup(skb, &fib, sizeof(fib), 0);
-	if ((rc == BPF_FIB_LKUP_RET_SUCCESS || rc == BPF_FIB_LKUP_RET_NO_NEIGH) &&
-	    (src_flags & EP_F_INTERNAL)) {
+	__builtin_memcpy(fib.ipv6_src, saddr, 16);
+	__builtin_memcpy(fib.ipv6_dst, daddr, 16);
+	long rc = bpf_fib_lookup(skb, &fib, sizeof(fib), BPF_FIB_LOOKUP_SRC);
+
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED && rev_dnat) {
+		/* Reply to the host's connection to its own address: back
+		 * through lo, as for IPv4.
+		 */
+		__u8 zero_mac[6] = {};
+		if (bpf_skb_store_bytes(skb, 0, zero_mac, sizeof(zero_mac), 0) < 0) {
+			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			return NETKIT_DROP;
+		}
+		count(self, DIR_EGRESS, REASON_REV_DNAT, skb->len);
+		return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
+	}
+	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
+		/* A host address: published port means hairpin to its owner. */
+		struct port6_val *pv = NULL;
+		if (has_l4 && !l.is_echo)
+			pv = lookup_port6(daddr, l.dport, l.proto, true);
+		if (!pv) {
+			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			return NETKIT_PASS;
+		}
+		__u8 ctr[16];
+		__be16 ctr_port = pv->ctr_port;
+		__builtin_memcpy(ctr, pv->ctr_addr, 16);
+		struct nat6_key k = { .sport = ctr_port, .dport = l.sport, .proto = l.proto, .dir = NAT_DNAT_REPLY };
+		__builtin_memcpy(k.saddr, ctr, 16);
+		__builtin_memcpy(k.daddr, saddr, 16);
+		struct nat6_val v = { .port = l.dport };
+		__builtin_memcpy(v.addr, daddr, 16);
+		if (bpf_map_update_elem(&netker_nat6, &k, &v, BPF_ANY) != 0 ||
+		    rewrite_port(skb, &l, false, l.dport, ctr_port) < 0 ||
+		    rewrite_addr6(skb, &l, false, daddr, ctr) < 0) {
+			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			return NETKIT_DROP;
+		}
+		dst = bpf_map_lookup_elem(&netker_endpoints6, ctr);
+		if (!dst) {
+			count(self, DIR_EGRESS, REASON_DROP_NOT_OURS, skb->len);
+			return NETKIT_DROP;
+		}
+		return to_local(skb, self, dst, REASON_DNAT, true);
+	}
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
+		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		return NETKIT_PASS;
+	}
+
+	/* Out through an uplink. */
+	if (src_flags & EP_F_INTERNAL) {
 		count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
 		return NETKIT_DROP;
 	}
-	count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
-	return NETKIT_PASS;
+	__u32 out_ifindex = fib.ifindex;
+	if (!rev_dnat) {
+		__u8 nat_addr[16];
+		__builtin_memcpy(nat_addr, fib.ipv6_src, 16);
+		if (!has_l4 || addr6_is_zero(nat_addr)) {
+			/* Extension headers, fragments, other protocols: the
+			 * host stack and nftables masquerade handle it.
+			 */
+			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			return NETKIT_PASS;
+		}
+		struct nat6_val *nv = snat6_lookup_or_alloc(&l, saddr, daddr, nat_addr, self);
+		if (!nv) {
+			count(self, DIR_EGRESS, REASON_DROP_NAT_EXHAUSTED, skb->len);
+			return NETKIT_DROP;
+		}
+		__be16 nat_port = nv->port;
+		if (rewrite_port(skb, &l, true, l.sport, nat_port) < 0 ||
+		    rewrite_addr6(skb, &l, true, saddr, nat_addr) < 0) {
+			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			return NETKIT_DROP;
+		}
+	}
+	if (dec_hoplimit(skb) < 0) {
+		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		return NETKIT_PASS;
+	}
+	count(self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT, skb->len);
+	return bpf_redirect_neigh(out_ifindex, NULL, 0, 0);
 }
 
 /* to_container6 delivers only IPv6 addressed to this endpoint. */
@@ -205,25 +304,19 @@ static __always_inline int to_container6(struct __sk_buff *skb, struct ethhdr *e
 	return NETKIT_PASS;
 }
 
-SEC("netkit/peer")
-int nk_from_container(struct __sk_buff *skb)
+/* from_container4 is nk_from_container's IPv4 path. Like from_container6
+ * it's its own BPF function: the verifier adds up the stack frames of
+ * caller and callee, so neither family's locals may sit in the caller.
+ */
+static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u32 self)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct ethhdr *eth = data;
-	__u32 self = skb->ifindex;
 	struct l4 l = {};
 
 	if ((void *)(eth + 1) > data_end) {
 		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
-		return NETKIT_DROP;
-	}
-	if (eth->h_proto == bpf_htons(ETH_P_ARP))
-		return from_container_arp(skb, eth, self);
-	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
-		return from_container6(skb, eth, self);
-	if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-		count(self, DIR_EGRESS, REASON_DROP_PROTO, skb->len);
 		return NETKIT_DROP;
 	}
 	struct iphdr *ip = (void *)(eth + 1);
@@ -389,6 +482,30 @@ int nk_from_container(struct __sk_buff *skb)
 	return bpf_redirect_neigh(out_ifindex, NULL, 0, 0);
 }
 
+SEC("netkit/peer")
+int nk_from_container(struct __sk_buff *skb)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+	__u32 self = skb->ifindex;
+
+	if ((void *)(eth + 1) > data_end) {
+		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		return NETKIT_DROP;
+	}
+	switch (eth->h_proto) {
+	case bpf_htons(ETH_P_ARP):
+		return from_container_arp(skb, eth, self);
+	case bpf_htons(ETH_P_IP):
+		return from_container4(skb, self);
+	case bpf_htons(ETH_P_IPV6):
+		return from_container6(skb, self);
+	}
+	count(self, DIR_EGRESS, REASON_DROP_PROTO, skb->len);
+	return NETKIT_DROP;
+}
+
 SEC("netkit/primary")
 int nk_to_container(struct __sk_buff *skb)
 {
@@ -432,7 +549,7 @@ static __always_inline bool is_loopback(__be32 addr)
 /* host_ingress translates replies to masqueraded flows and connections to
  * published ports, then sends them straight into the container.
  */
-static __always_inline int host_ingress(struct __sk_buff *skb, bool on_lo)
+static __attribute__((noinline)) int host_ingress(struct __sk_buff *skb, bool on_lo)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -524,15 +641,123 @@ static __always_inline int host_ingress(struct __sk_buff *skb, bool on_lo)
 	return bpf_redirect_peer(ifindex, 0);
 }
 
+static __always_inline bool ip6_is_loopback(const __u8 *a)
+{
+	for (int i = 0; i < 15; i++)
+		if (a[i])
+			return false;
+	return a[15] == 1;
+}
+
+/* host_ingress6 is host_ingress for IPv6: reverse SNAT66 for replies on an
+ * uplink, DNAT for published ports, then straight into the container.
+ */
+static __attribute__((noinline)) int host_ingress6(struct __sk_buff *skb, bool on_lo)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+	struct ipv6hdr *ip6 = (void *)(eth + 1);
+	struct l4 l = {};
+
+	if ((void *)(ip6 + 1) > data_end)
+		return TCX_NEXT;
+	__u8 saddr[16], daddr[16];
+	__builtin_memcpy(saddr, &ip6->saddr, 16);
+	__builtin_memcpy(daddr, &ip6->daddr, 16);
+	/* [::1] is handled at connect() time by nk_sock_connect6. */
+	if (on_lo && ip6_is_loopback(daddr))
+		return TCX_NEXT;
+	if (!parse_l4_6(skb, ip6, &l))
+		return TCX_NEXT;
+
+	__u8 new_addr[16];
+	__be16 new_port;
+	__u32 ifindex;
+	__u8 reason;
+	struct nat6_val *v = NULL;
+
+	if (!on_lo) {
+		struct nat6_key k = { .sport = l.sport, .dport = l.dport, .proto = l.proto, .dir = NAT_SNAT_IN };
+		__builtin_memcpy(k.saddr, saddr, 16);
+		__builtin_memcpy(k.daddr, daddr, 16);
+		v = bpf_map_lookup_elem(&netker_nat6, &k);
+	}
+	if (v) {
+		__builtin_memcpy(new_addr, v->addr, 16);
+		new_port = v->port;
+		ifindex = v->ifindex;
+		reason = REASON_REV_SNAT;
+	} else {
+		struct port6_val *pv = lookup_port6(daddr, l.dport, l.proto, false);
+		if (!pv) {
+			bool local = on_lo;
+			if (!local) {
+				struct bpf_fib_lookup fib = {
+					.family = AF_INET6,
+					.ifindex = skb->ingress_ifindex,
+				};
+				__builtin_memcpy(fib.ipv6_src, saddr, 16);
+				__builtin_memcpy(fib.ipv6_dst, daddr, 16);
+				local = bpf_fib_lookup(skb, &fib, sizeof(fib), 0) == BPF_FIB_LKUP_RET_NOT_FWDED;
+			}
+			if (!local)
+				return TCX_NEXT;
+			__u8 any[16] = {};
+			pv = lookup_port6(any, l.dport, l.proto, false);
+			if (!pv)
+				return TCX_NEXT;
+		}
+		__builtin_memcpy(new_addr, pv->ctr_addr, 16);
+		new_port = pv->ctr_port;
+		ifindex = pv->ifindex;
+		reason = REASON_DNAT;
+		if (!on_lo) {
+			struct endpoint *ep = bpf_map_lookup_elem(&netker_endpoints6, new_addr);
+			if (!ep || (ep->flags & EP_F_INTERNAL))
+				return TCX_NEXT;
+		}
+		struct nat6_key rk = { .sport = new_port, .dport = l.sport, .proto = l.proto, .dir = NAT_DNAT_REPLY };
+		__builtin_memcpy(rk.saddr, new_addr, 16);
+		__builtin_memcpy(rk.daddr, saddr, 16);
+		struct nat6_val rv = { .port = l.dport };
+		__builtin_memcpy(rv.addr, daddr, 16);
+		if (bpf_map_update_elem(&netker_nat6, &rk, &rv, BPF_ANY) != 0)
+			return TCX_DROP;
+	}
+	if (rewrite_port(skb, &l, false, l.dport, new_port) < 0 ||
+	    rewrite_addr6(skb, &l, false, daddr, new_addr) < 0) {
+		count(ifindex, DIR_INGRESS, REASON_DROP_MALFORMED, skb->len);
+		return TCX_DROP;
+	}
+	if (!on_lo && dec_hoplimit(skb) < 0)
+		return TCX_NEXT;
+	count(ifindex, DIR_INGRESS, reason, skb->len);
+	return bpf_redirect_peer(ifindex, 0);
+}
+
+static __always_inline bool is_ipv6(struct __sk_buff *skb)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct ethhdr *eth = data;
+
+	return (void *)(eth + 1) <= data_end && eth->h_proto == bpf_htons(ETH_P_IPV6);
+}
+
 SEC("tcx/ingress")
 int nk_from_world(struct __sk_buff *skb)
 {
+	if (is_ipv6(skb))
+		return host_ingress6(skb, false);
 	return host_ingress(skb, false);
 }
 
 SEC("tcx/ingress")
 int nk_from_lo(struct __sk_buff *skb)
 {
+	if (is_ipv6(skb))
+		return host_ingress6(skb, true);
 	return host_ingress(skb, true);
 }
 
@@ -554,6 +779,33 @@ int nk_sock_connect4(struct bpf_sock_addr *ctx)
 	if (!pv)
 		return 1;
 	ctx->user_ip4 = pv->ctr_addr;
+	ctx->user_port = pv->ctr_port;
+	count(pv->ifindex, DIR_INGRESS, REASON_DNAT, 0);
+	return 1;
+}
+
+SEC("cgroup/connect6")
+int nk_sock_connect6(struct bpf_sock_addr *ctx)
+{
+	struct config *cfg = get_config();
+
+	/* Inside containers [::1] is the container's own loopback. */
+	if (!cfg || bpf_get_netns_cookie(ctx) != cfg->host_netns_cookie)
+		return 1;
+	if (ctx->protocol != IPPROTO_TCP && ctx->protocol != IPPROTO_UDP)
+		return 1;
+	__u32 dst[4] = { ctx->user_ip6[0], ctx->user_ip6[1], ctx->user_ip6[2], ctx->user_ip6[3] };
+	if (!ip6_is_loopback((__u8 *)dst))
+		return 1;
+	struct port6_val *pv = lookup_port6((__u8 *)dst, (__be16)ctx->user_port, ctx->protocol, true);
+	if (!pv)
+		return 1;
+	__u32 ctr[4];
+	__builtin_memcpy(ctr, pv->ctr_addr, 16);
+	ctx->user_ip6[0] = ctr[0];
+	ctx->user_ip6[1] = ctr[1];
+	ctx->user_ip6[2] = ctr[2];
+	ctx->user_ip6[3] = ctr[3];
 	ctx->user_port = pv->ctr_port;
 	count(pv->ifindex, DIR_INGRESS, REASON_DNAT, 0);
 	return 1;

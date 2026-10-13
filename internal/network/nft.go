@@ -158,6 +158,8 @@ func (p PortMapping) String() string {
 	ip := p.HostIP
 	if ip == "" {
 		ip = "0.0.0.0"
+	} else if strings.Contains(ip, ":") {
+		ip = "[" + ip + "]"
 	}
 	return fmt.Sprintf("%s:%d->%d/%s", ip, p.HostPort, p.ContainerPort, p.Protocol)
 }

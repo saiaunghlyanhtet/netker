@@ -161,3 +161,65 @@ static __always_inline struct port_val *lookup_port(__be32 addr, __be16 port, __
 	key.addr = 0;
 	return bpf_map_lookup_elem(&netker_ports, &key);
 }
+
+/* IPv6 NAT: the same directions as netker_nat, with IPv6 addresses. */
+struct nat6_key {
+	__u8 saddr[16];
+	__u8 daddr[16];
+	__be16 sport;
+	__be16 dport;
+	__u8 proto;
+	__u8 dir;
+	__u16 pad;
+};
+
+struct nat6_val {
+	__u8 addr[16];
+	__be16 port;
+	__u16 pad;
+	__u32 ifindex; /* NAT_SNAT_IN: primary of the container */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 262144);
+	__type(key, struct nat6_key);
+	__type(value, struct nat6_val);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_nat6 SEC(".maps");
+
+/* Published ports on IPv6 host addresses; addr all-zero means every one. */
+struct port6_key {
+	__u8 addr[16];
+	__be16 port;
+	__u8 proto;
+	__u8 pad;
+};
+
+struct port6_val {
+	__u8 ctr_addr[16];
+	__be16 ctr_port;
+	__u16 pad;
+	__u32 ifindex; /* primary of the container */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct port6_key);
+	__type(value, struct port6_val);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_ports6 SEC(".maps");
+
+static __always_inline struct port6_val *lookup_port6(const __u8 *addr, __be16 port, __u8 proto, bool addr_is_local)
+{
+	struct port6_key key = { .port = port, .proto = proto };
+	struct port6_val *v;
+
+	__builtin_memcpy(key.addr, addr, 16);
+	v = bpf_map_lookup_elem(&netker_ports6, &key);
+	if (v || !addr_is_local)
+		return v;
+	__builtin_memset(key.addr, 0, 16);
+	return bpf_map_lookup_elem(&netker_ports6, &key);
+}
