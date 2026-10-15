@@ -136,37 +136,17 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 	if err := setupHostSide(ep); err != nil {
 		return nil, err
 	}
-	var peer netlink.Link
-	err = netns.Do(nsPath, func() error {
-		if err := setupContainerSide(ep, n.Subnet, n.Subnet6, defaultRoute); err != nil {
-			return err
-		}
-		peer, err = netlink.LinkByName(ep.IfName)
-		return err
-	})
+	err = netns.Do(nsPath, func() error { return setupContainerSide(ep, n.Subnet, n.Subnet6, defaultRoute) })
 	if err != nil {
 		return nil, err
 	}
-	host, err := netlink.LinkByName(ep.HostIf)
+	dep, err := datapathEndpoint(n, ep, nsPath)
 	if err != nil {
 		return nil, err
 	}
-	ep.HostIfIndex = host.Attrs().Index
+	ep.HostIfIndex = dep.HostIfIndex
 	if mode == DatapathEBPF {
-		err = s.dp.Attach(containerID, datapath.Endpoint{
-			IP:          ip,
-			IP6:         ip6,
-			HostIf:      ep.HostIf,
-			HostIfIndex: ep.HostIfIndex,
-			PeerIfIndex: peer.Attrs().Index,
-			NetID:       datapath.NetID(n.Name),
-			Internal:    n.Internal,
-			NoICC:       n.NoICC,
-			L2:          n.Mode == netkit.ModeL2,
-			HostMAC:     host.Attrs().HardwareAddr,
-			PeerMAC:     peer.Attrs().HardwareAddr,
-		})
-		if err != nil {
+		if err := s.dp.Attach(containerID, dep); err != nil {
 			return nil, err
 		}
 	}
@@ -174,6 +154,37 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 		return nil, err
 	}
 	return ep, nil
+}
+
+// datapathEndpoint describes ep for the BPF maps, from the live devices:
+// the primary in the host netns and the peer in the container's.
+func datapathEndpoint(n *Network, ep *Endpoint, nsPath string) (datapath.Endpoint, error) {
+	host, err := netlink.LinkByName(ep.HostIf)
+	if err != nil {
+		return datapath.Endpoint{}, err
+	}
+	var peer netlink.Link
+	err = netns.Do(nsPath, func() error {
+		var err error
+		peer, err = netlink.LinkByName(ep.IfName)
+		return err
+	})
+	if err != nil {
+		return datapath.Endpoint{}, fmt.Errorf("%s in the container: %w", ep.IfName, err)
+	}
+	return datapath.Endpoint{
+		IP:          ep.IP,
+		IP6:         ep.IP6,
+		HostIf:      ep.HostIf,
+		HostIfIndex: host.Attrs().Index,
+		PeerIfIndex: peer.Attrs().Index,
+		NetID:       datapath.NetID(n.Name),
+		Internal:    n.Internal,
+		NoICC:       n.NoICC,
+		L2:          n.Mode == netkit.ModeL2,
+		HostMAC:     host.Attrs().HardwareAddr,
+		PeerMAC:     peer.Attrs().HardwareAddr,
+	}, nil
 }
 
 // datapathMode resolves NETKER_DATAPATH: "auto" picks eBPF when the programs
@@ -191,6 +202,11 @@ func (s *Store) datapathMode() (string, error) {
 		err := s.dp.Load()
 		if err == nil {
 			return DatapathEBPF, nil
+		}
+		// Maps from another netker version: new containers would end up
+		// on a different datapath than the running ones. Stop instead.
+		if errors.Is(err, datapath.ErrIncompatibleMaps) {
+			return "", err
 		}
 		// Unprivileged (or root in a user namespace) the fallback is
 		// expected. As real root it hides a real problem, such as the

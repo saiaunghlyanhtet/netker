@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"fmt"
+	"github.com/cilium/ebpf"
 	"io"
 	"net"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -952,5 +954,146 @@ func TestEBPFPing6ThroughNAT(t *testing.T) {
 	}
 	if metric(t, s, ep.HostIfIndex, "rev-snat") == 0 {
 		t.Fatal("ICMPv6 echo reply was not un-masqueraded in BPF")
+	}
+}
+
+// pinIncompatible replaces the pinned map name with one of another layout,
+// as a different netker version would have left it. Programs already
+// attached keep the map they were loaded with.
+func pinIncompatible(t *testing.T, bpffs, name string, typ ebpf.MapType, keySize uint32) {
+	t.Helper()
+	p := filepath.Join(bpffs, "maps", name)
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: typ, KeySize: keySize, ValueSize: 8, MaxEntries: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Pin(p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEBPFMapLayoutChange(t *testing.T) {
+	s, bpffs := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	epA, nsA := attachT(t, s, n, "a71a71a71a71a71a")
+	epB, nsB := attachT(t, s, n, "b71b71b71b71b71b")
+	ports := []PortMapping{{HostPort: 8090, ContainerPort: 80, Protocol: "tcp"}}
+	if err := s.Publish("b71b71b71b71b71b", epB, ports); err != nil {
+		t.Fatal(err)
+	}
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	before, _ := s.dp.Links()
+
+	// An older netker left maps with another layout behind.
+	pinIncompatible(t, bpffs, "netker_endpoints", ebpf.Hash, 4)
+	pinIncompatible(t, bpffs, "netker_nat", ebpf.LRUHash, 16)
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("running containers stopped working when the pins changed: %q, %v", got, err)
+	}
+
+	s2 := NewStore(s.paths)
+	defer s2.dp.Close()
+	err := s2.dp.Load()
+	if !errors.Is(err, datapath.ErrIncompatibleMaps) {
+		t.Fatalf("load with stale maps: %v", err)
+	}
+	for _, want := range []string{"netker_endpoints", "netker_nat", "ValueSize", "netker system datapath upgrade"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q doesn't mention %q", err, want)
+		}
+	}
+
+	t.Run("auto mode refuses instead of falling back to legacy", func(t *testing.T) {
+		t.Setenv("NETKER_DATAPATH", "auto")
+		id := "c71c71c71c71c71c"
+		ns := newNS(t, s.paths, id)
+		if _, err := s2.Attach(n, id, ns, 0, netip.Addr{}, true); !errors.Is(err, datapath.ErrIncompatibleMaps) {
+			t.Fatalf("attach with stale maps: %v", err)
+		}
+		if _, err := netlink.LinkByName(HostIfName(id, 0)); err == nil {
+			t.Fatal("netkit pair left behind")
+		}
+	})
+
+	t.Run("a failed rebuild leaves bpffs untouched", func(t *testing.T) {
+		broken := []RestoreItem{
+			{ContainerID: "a71a71a71a71a71a", NetNSPath: nsA, Endpoints: []*Endpoint{epA}},
+			{ContainerID: "b71b71b71b71b71b", NetNSPath: "/nonexistent/netns", Endpoints: []*Endpoint{epB}},
+		}
+		if _, err := s2.RebuildDatapath(broken); err == nil {
+			t.Fatal("rebuild with an unreachable container succeeded")
+		}
+		s2.dp.Close()
+		bad, err := s2.dp.CheckMaps()
+		if err != nil || len(bad) != 2 {
+			t.Fatalf("pins changed by a failed rebuild: %+v, %v", bad, err)
+		}
+		if after, _ := s2.dp.Links(); after[0].ProgramID != before[0].ProgramID {
+			t.Fatal("a failed rebuild swapped programs")
+		}
+		if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+			t.Fatalf("running containers broken by a failed rebuild: %q, %v", got, err)
+		}
+	})
+
+	report, err := s2.RebuildDatapath([]RestoreItem{
+		{ContainerID: "a71a71a71a71a71a", NetNSPath: nsA, Endpoints: []*Endpoint{epA}},
+		{ContainerID: "b71b71b71b71b71b", NetNSPath: nsB, Endpoints: []*Endpoint{epB}, Ports: ports},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rebuilt []string
+	for _, m := range report.Rebuilt {
+		rebuilt = append(rebuilt, m.Name)
+	}
+	if !slices.Equal(rebuilt, []string{"netker_endpoints", "netker_nat"}) || report.Endpoints != 2 || report.Links < len(before) {
+		t.Fatalf("report %+v", report)
+	}
+
+	s3 := NewStore(s.paths)
+	defer s3.dp.Close()
+	if err := s3.dp.Load(); err != nil {
+		t.Fatalf("load after the rebuild: %v", err)
+	}
+	eps, _ := s3.dp.Endpoints()
+	var ips []netip.Addr
+	for _, e := range eps {
+		ips = append(ips, e.IP)
+	}
+	if !slices.Contains(ips, epA.IP) || !slices.Contains(ips, epB.IP) {
+		t.Fatalf("endpoints not restored: %v", ips)
+	}
+	if pe, _ := s3.dp.Ports(); len(pe) != 1 || pe[0].HostPort != 8090 {
+		t.Fatalf("published port not restored: %+v", pe)
+	}
+	after, _ := s3.dp.Links()
+	for i := range before {
+		if before[i].ProgramID == after[i].ProgramID {
+			t.Fatalf("link %s still runs the old program", after[i].Pin)
+		}
+	}
+	// The new programs use the rebuilt maps.
+	fwd := metric(t, s, epA.HostIfIndex, "forward-local")
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("A->B after the rebuild: %q, %v", got, err)
+	}
+	if metric(t, s, epA.HostIfIndex, "forward-local") == fwd {
+		t.Fatal("traffic after the rebuild wasn't forwarded by the new programs")
+	}
+	// Running it again (e.g. after a failure halfway) changes nothing.
+	again, err := s3.RebuildDatapath([]RestoreItem{
+		{ContainerID: "a71a71a71a71a71a", NetNSPath: nsA, Endpoints: []*Endpoint{epA}},
+		{ContainerID: "b71b71b71b71b71b", NetNSPath: nsB, Endpoints: []*Endpoint{epB}, Ports: ports},
+	})
+	if err != nil || len(again.Rebuilt) != 0 {
+		t.Fatalf("second rebuild: %+v, %v", again, err)
+	}
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("A->B after a second rebuild: %q, %v", got, err)
 	}
 }

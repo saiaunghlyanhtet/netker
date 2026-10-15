@@ -113,13 +113,22 @@ func datapathStatusCmd() *cobra.Command {
 func datapathUpgradeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "upgrade",
-		Short: "Atomically replace the programs of every container with this binary's",
+		Short: "Move every container onto this binary's programs, rebuilding maps whose layout changed",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			dp := manager().Networks.Datapath()
-			defer dp.Close()
-			n, err := dp.Upgrade()
-			fmt.Fprintf(cmd.OutOrStdout(), "updated %d link(s)\n", n)
+			m := manager()
+			defer m.Networks.Datapath().Close()
+			r, err := m.RebuildDatapath()
+			out := cmd.OutOrStdout()
+			if r != nil {
+				for _, mp := range r.Rebuilt {
+					fmt.Fprintf(out, "rebuilt map %s (%s)\n", mp.Name, mp.Reason)
+				}
+				if len(r.Rebuilt) > 0 {
+					fmt.Fprintf(out, "restored %d endpoint(s) from the container records; NAT flows through rebuilt maps were reset\n", r.Endpoints)
+				}
+				fmt.Fprintf(out, "updated %d link(s)\n", r.Links)
+			}
 			return err
 		},
 	}

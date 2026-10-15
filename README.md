@@ -48,6 +48,7 @@ Commands: `run create start stop restart kill rm ps exec logs inspect port`,
 ```sh
 sudo bin/netker system datapath status    # pinned links, endpoint map, counters per verdict
 sudo bin/netker system datapath upgrade   # swap every container's programs atomically
+                                          # (run after upgrading netker; see below)
 sudo bin/netker system datapath sync      # attach to uplinks that appeared since
 sudo bin/netker system datapath reset-host  # detach uplink/lo/cgroup hooks
 ```
@@ -74,6 +75,23 @@ make test-ebpf          # network tests as root in a privileged Docker container
 make e2e-root           # full CLI test as root in a privileged Docker container (eBPF)
 go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
 ```
+
+## Upgrading netker
+
+The datapath outlives the CLI: maps and links are pinned under
+`/sys/fs/bpf/netker`, and running containers keep using the programs of the
+netker version that started them. After installing a new netker, run
+`sudo netker system datapath upgrade` to move every container onto the new
+programs without restarting anything.
+
+If the new version changed the layout of a map, netker refuses to start new
+eBPF containers until you do (`system check` shows it, and `auto` doesn't
+fall back to the legacy datapath behind your back). The upgrade then
+recreates those maps and refills endpoints and published ports from the
+container records; connections through NAT reset once if the NAT maps were
+among them. The pinned maps are only replaced once every container runs the
+new programs, so an upgrade that fails leaves everything as it was, and
+running it again is always safe.
 
 ## Known gaps
 
