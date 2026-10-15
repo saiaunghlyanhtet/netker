@@ -58,7 +58,17 @@ func portKeys(p Port, hasIPv6 bool) (k4 *netkerPortKey, k6 *netkerPort6Key, err 
 // Publish maps each host port to the container (ctrIP6 may be the zero
 // Addr). A port that's already published fails, like Docker's "port is
 // already allocated".
-func (d *Datapath) Publish(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port) (err error) {
+func (d *Datapath) Publish(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port) error {
+	return d.publish(ctrIP, ctrIP6, ifindex, ports, ebpf.UpdateNoExist)
+}
+
+// RestorePorts rewrites a container's published ports, e.g. after the
+// maps were rebuilt. Existing entries are overwritten.
+func (d *Datapath) RestorePorts(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port) error {
+	return d.publish(ctrIP, ctrIP6, ifindex, ports, ebpf.UpdateAny)
+}
+
+func (d *Datapath) publish(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port, flags ebpf.MapUpdateFlags) (err error) {
 	if err := d.EnsureHost(); err != nil {
 		return err
 	}
@@ -81,13 +91,13 @@ func (d *Datapath) Publish(ctrIP, ctrIP6 netip.Addr, ifindex int, ports []Port) 
 		}
 		if k4 != nil {
 			v := netkerPortVal{CtrAddr: be32(ctrIP), CtrPort: be16(p.ContainerPort), Ifindex: uint32(ifindex)}
-			if err := d.objs.NetkerPorts.Update(k4, v, ebpf.UpdateNoExist); err != nil {
+			if err := d.objs.NetkerPorts.Update(k4, v, flags); err != nil {
 				return taken(p, err)
 			}
 		}
 		if k6 != nil {
 			v := netkerPort6Val{CtrAddr: ctrIP6.As16(), CtrPort: be16(p.ContainerPort), Ifindex: uint32(ifindex)}
-			if err := d.objs.NetkerPorts6.Update(k6, v, ebpf.UpdateNoExist); err != nil {
+			if err := d.objs.NetkerPorts6.Update(k6, v, flags); err != nil {
 				// The IPv4 half is in place; roll it back with this port.
 				done = append(done, p)
 				return taken(p, err)

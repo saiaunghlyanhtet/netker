@@ -45,6 +45,9 @@ func NetID(network string) uint32 { return crc32.ChecksumIEEE([]byte(network)) }
 type Datapath struct {
 	root string
 	objs *netkerObjects
+	// pendingPins are maps loaded by RebuildMaps that replace incompatible
+	// pins once FinishRebuild has moved the programs onto them.
+	pendingPins map[string]*ebpf.Map
 }
 
 func New(root string) *Datapath { return &Datapath{root: root} }
@@ -69,6 +72,13 @@ func (d *Datapath) Load() error {
 	err := loadNetkerObjects(&objs, &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{PinPath: d.mapsDir()},
 	})
+	if errors.Is(err, ebpf.ErrMapIncompatible) {
+		// One stale pin fails the whole collection; report all of them,
+		// with the fix, instead of the library's first error.
+		if bad, cerr := d.CheckMaps(); cerr == nil && len(bad) > 0 {
+			return &IncompatibleMapsError{Maps: bad}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("load eBPF datapath: %w", err)
 	}
@@ -77,6 +87,7 @@ func (d *Datapath) Load() error {
 }
 
 func (d *Datapath) Close() error {
+	d.pendingPins = nil
 	if d.objs == nil {
 		return nil
 	}
@@ -90,35 +101,13 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	if err := d.Load(); err != nil {
 		return err
 	}
-	val := netkerEndpoint{
-		Ifindex:     uint32(ep.HostIfIndex),
-		PeerIfindex: uint32(ep.PeerIfIndex),
-		Netid:       ep.NetID,
-	}
-	if ep.Internal {
-		val.Flags |= flagInternal
-	}
-	if ep.NoICC {
-		val.Flags |= flagNoICC
-	}
-	if ep.L2 {
-		val.Flags |= flagL2
-	}
-	copy(val.Mac[:], ep.HostMAC)
-	copy(val.PeerMac[:], ep.PeerMAC)
-	key := ep.IP.As4()
-	if err := d.objs.NetkerEndpoints.Put(key, val); err != nil {
-		return fmt.Errorf("endpoint map: %w", err)
-	}
 	defer func() {
 		if err != nil {
 			d.Detach(containerID, ep.HostIf, ep.IP, ep.IP6)
 		}
 	}()
-	if ep.IP6.IsValid() {
-		if err := d.objs.NetkerEndpoints6.Put(netkerIp6Key{Addr: ep.IP6.As16()}, val); err != nil {
-			return fmt.Errorf("IPv6 endpoint map: %w", err)
-		}
+	if err := d.RestoreEndpoint(ep); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Join(d.linksDir(), containerID), 0o700); err != nil {
 		return err
@@ -142,6 +131,40 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 		}
 	}
 	return d.EnsureHost()
+}
+
+// RestoreEndpoint writes an endpoint's map entries, IPv4 and, if it has
+// one, IPv6, without touching its links. Attach uses it, and so does the
+// rebuild after a map layout change.
+func (d *Datapath) RestoreEndpoint(ep Endpoint) error {
+	if err := d.Load(); err != nil {
+		return err
+	}
+	val := netkerEndpoint{
+		Ifindex:     uint32(ep.HostIfIndex),
+		PeerIfindex: uint32(ep.PeerIfIndex),
+		Netid:       ep.NetID,
+	}
+	if ep.Internal {
+		val.Flags |= flagInternal
+	}
+	if ep.NoICC {
+		val.Flags |= flagNoICC
+	}
+	if ep.L2 {
+		val.Flags |= flagL2
+	}
+	copy(val.Mac[:], ep.HostMAC)
+	copy(val.PeerMac[:], ep.PeerMAC)
+	if err := d.objs.NetkerEndpoints.Put(ep.IP.As4(), val); err != nil {
+		return fmt.Errorf("endpoint map: %w", err)
+	}
+	if ep.IP6.IsValid() {
+		if err := d.objs.NetkerEndpoints6.Put(netkerIp6Key{Addr: ep.IP6.As16()}, val); err != nil {
+			return fmt.Errorf("IPv6 endpoint map: %w", err)
+		}
+	}
+	return nil
 }
 
 // Detach removes the endpoint (ip6 may be the zero Addr) and releases its

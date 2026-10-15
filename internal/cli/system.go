@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,7 +65,9 @@ func checkCmd() *cobra.Command {
 			bpffs := unix.Statfs("/sys/fs/bpf", &sfs) == nil && sfs.Type == unix.BPF_FS_MAGIC
 			checks = append(checks, check{name: "bpffs at /sys/fs/bpf", ok: bpffs, warn: !bpffs, detail: "needed by the eBPF datapath"})
 			dp := manager().Networks.Datapath()
-			if err := dp.Load(); err != nil {
+			if err := dp.Load(); errors.Is(err, datapath.ErrIncompatibleMaps) {
+				checks = append(checks, check{name: "eBPF datapath", detail: err.Error()})
+			} else if err != nil {
 				checks = append(checks, check{name: "eBPF datapath", warn: true, detail: "not loadable, containers use the legacy datapath: " + err.Error()})
 			} else {
 				checks = append(checks, check{name: "eBPF datapath", ok: true})

@@ -114,3 +114,28 @@ func defaultEndpoint(c *Container) *network.Endpoint {
 	}
 	return nil
 }
+
+// RebuildDatapath rewrites the eBPF datapath from the container records
+// (see network.Store.RebuildDatapath), under the container lock so no
+// container comes or goes meanwhile.
+func (m *Manager) RebuildDatapath() (*network.RebuildReport, error) {
+	unlock, err := m.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	all, err := m.List()
+	if err != nil {
+		return nil, err
+	}
+	var items []network.RestoreItem
+	for _, c := range all {
+		if len(c.Endpoints) == 0 {
+			continue
+		}
+		items = append(items, network.RestoreItem{
+			ContainerID: c.ID, NetNSPath: c.NetNSPath, Endpoints: c.Endpoints, Ports: c.Ports,
+		})
+	}
+	return m.Networks.RebuildDatapath(items)
+}
