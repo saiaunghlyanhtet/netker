@@ -32,7 +32,7 @@ vet:
 test-ebpf:
 	CGO_ENABLED=0 go test -c -o bin/network.test ./internal/network/
 	docker run --rm --privileged -v $(CURDIR)/bin:/t:ro alpine:latest sh -c \
-		'apk add -q nftables && mount -t bpf bpf /sys/fs/bpf && /t/network.test -test.v -test.count=1'
+		'apk add -q nftables && mount -t bpf bpf /sys/fs/bpf && /t/network.test -test.v -test.count=1 -test.timeout 10m'
 
 # Full CLI test as real root (eBPF datapath) in a throwaway privileged
 # container. The state dir is a tmpfs because overlayfs can't use Docker's

@@ -52,6 +52,14 @@ if [[ "$datapath" == ebpf ]]; then
 	status=$(netker system datapath status)
 	expect "eBPF: programs pinned on both sides" "primary" "$status"
 	expect "eBPF: container->container was redirected in BPF" "forward-local" "$status"
+	trace_out=$(mktemp)
+	timeout 10 netker net trace --count 1 --format json e2e-web >"$trace_out" 2>/dev/null &
+	tpid=$!
+	sleep 1
+	timeout 10 netker run --rm alpine wget -T 3 -qO- "http://$ip/" >/dev/null 2>&1 || true
+	wait "$tpid" || true
+	expect "trace: verdicts for one container" "\"device\":\"e2e-web/eth0\"" "$(cat "$trace_out")"
+	rm -f "$trace_out"
 	updated=$(netker system datapath upgrade | sed -n 's/updated \([0-9]*\) link.*/\1/p')
 	(( updated >= 2 )) || fail "eBPF: upgrade updated '$updated' links, want the container's 2 plus host hooks"
 	echo "ok: eBPF: upgrade swapped $updated programs in place"
@@ -104,6 +112,16 @@ if netker run --rm --network e2e-iso alpine wget -T 2 -qO- "http://$iso1_ip/" >/
 	fail "icc: containers on an --icc=false network reached each other"
 fi
 echo "ok: icc: container-to-container blocked"
+if [[ "$datapath" == ebpf ]]; then
+	trace_out=$(mktemp)
+	timeout 10 netker net trace --drops --count 1 e2e-iso1 >"$trace_out" 2>/dev/null &
+	tpid=$!
+	sleep 1
+	netker run --rm --network e2e-iso alpine wget -T 1 -qO- "http://$iso1_ip/" >/dev/null 2>&1 || true
+	wait "$tpid" || true
+	expect "trace: --drops reports the --icc=false drop" "drop-icc" "$(cat "$trace_out")"
+	rm -f "$trace_out"
+fi
 expect "icc: published ports stay reachable" "hello from" "$(netker run --rm --network e2e-iso alpine wget -T 3 -qO- http://192.0.2.10:8080/)"
 netker rm -f e2e-iso1 >/dev/null
 netker network rm e2e-iso >/dev/null

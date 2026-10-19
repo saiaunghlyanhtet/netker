@@ -89,7 +89,7 @@ static __always_inline int rewrite_addr6(struct __sk_buff *skb, const struct l4 
 }
 
 /* snat6_lookup_or_alloc is snat_lookup_or_alloc for IPv6. */
-static __always_inline struct nat6_val *
+static __attribute__((noinline)) struct nat6_val *
 snat6_lookup_or_alloc(const struct l4 *l, const __u8 *ctr, const __u8 *remote, const __u8 *nat_addr,
 		      __u32 ctr_ifindex)
 {

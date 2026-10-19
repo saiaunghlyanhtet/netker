@@ -131,7 +131,109 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } netker_config SEC(".maps");
 
-static __always_inline void count(__u32 ifindex, __u8 dir, __u8 reason, __u32 len)
+/* Datapath events for "netker net trace", read through a perf buffer like
+ * Cilium's cilium_events. The kernel appends the start of the packet to
+ * each event (BPF_F_CTXLEN_MASK), so nothing is parsed here; netker
+ * decodes the headers. Without a reader the output fails right away, so
+ * events cost close to nothing until someone traces.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_events SEC(".maps");
+
+enum event_type {
+	EVENT_DROP = 1,  /* always sent */
+	EVENT_TRACE = 2, /* any other verdict, while a tracer holds the lease */
+};
+
+struct event_hdr {
+	__u8 type;
+	__u8 reason;
+	__u8 dir;
+	__u8 pad;
+	__u32 ifindex;
+	__u32 len;     /* packet length */
+	__u32 cap_len; /* packet bytes after this header */
+	__u64 ts;      /* bpf_ktime_get_ns() */
+};
+
+#define EVENT_CAP_LEN 128
+
+/* Tracing of non-drop verdicts. A tracer keeps until_ns a few seconds
+ * ahead; if it dies, tracing switches itself off.
+ */
+#define TRACE_F_IFINDEX 0x1 /* only devices in netker_trace_ifindex */
+
+struct trace_cfg {
+	__u64 until_ns;
+	__u32 flags;
+	__u32 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct trace_cfg);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_trace SEC(".maps");
+
+/* Primary ifindexes a tracer watches, with TRACE_F_IFINDEX. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32);
+	__type(value, __u8);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} netker_trace_ifindex SEC(".maps");
+
+/* Per-CPU scratch space for the 64-byte FIB lookup parameters, which would
+ * otherwise take a large share of the 512-byte stack. Nothing runs nested
+ * on the same CPU while a program uses it. Not pinned: it holds no state.
+ */
+/* Opaque to Go: bpf2go can't generate the anonymous unions inside. */
+struct fib_scratch {
+	__u8 buf[sizeof(struct bpf_fib_lookup)];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct fib_scratch);
+} netker_scratch_fib SEC(".maps");
+
+static __always_inline struct bpf_fib_lookup *scratch_fib(void)
+{
+	__u32 zero = 0;
+	struct bpf_fib_lookup *fib = (void *)bpf_map_lookup_elem(&netker_scratch_fib, &zero);
+
+	if (fib)
+		__builtin_memset(fib, 0, sizeof(*fib));
+	return fib;
+}
+
+static __always_inline bool is_drop(__u8 reason)
+{
+	return reason >= 10;
+}
+
+static __always_inline bool tracing(__u32 ifindex)
+{
+	__u32 zero = 0;
+	struct trace_cfg *cfg = bpf_map_lookup_elem(&netker_trace, &zero);
+
+	if (!cfg || cfg->until_ns < bpf_ktime_get_ns())
+		return false;
+	if ((cfg->flags & TRACE_F_IFINDEX) && !bpf_map_lookup_elem(&netker_trace_ifindex, &ifindex))
+		return false;
+	return true;
+}
+
+static __always_inline void add_metric(__u32 ifindex, __u8 dir, __u8 reason, __u32 len)
 {
 	struct metrics_key key = { .ifindex = ifindex, .dir = dir, .reason = reason };
 	struct metrics_val *val = bpf_map_lookup_elem(&netker_metrics, &key);
@@ -143,6 +245,37 @@ static __always_inline void count(__u32 ifindex, __u8 dir, __u8 reason, __u32 le
 	}
 	struct metrics_val init = { .packets = 1, .bytes = len };
 	bpf_map_update_elem(&netker_metrics, &key, &init, BPF_NOEXIST);
+}
+
+/* count records a verdict in the metrics and, for drops or while tracing,
+ * sends an event with the start of the packet. It's a BPF function of its
+ * own rather than inlined: it's called from dozens of places, and inlined
+ * copies of the event header pushed the IPv6 path over the 512-byte stack.
+ */
+static __attribute__((noinline)) void count(struct __sk_buff *skb, __u32 ifindex, __u8 dir, __u8 reason)
+{
+	add_metric(ifindex, dir, reason, skb->len);
+
+	bool drop = is_drop(reason);
+	if (!drop && !tracing(ifindex))
+		return;
+	struct event_hdr ev = {
+		.type = drop ? EVENT_DROP : EVENT_TRACE,
+		.reason = reason,
+		.dir = dir,
+		.ifindex = ifindex,
+		.len = skb->len,
+		.cap_len = skb->len < EVENT_CAP_LEN ? skb->len : EVENT_CAP_LEN,
+		.ts = bpf_ktime_get_ns(),
+	};
+	__u64 flags = ((__u64)ev.cap_len << 32) | BPF_F_CURRENT_CPU;
+	bpf_perf_event_output(skb, &netker_events, flags, &ev, sizeof(ev));
+}
+
+/* count_sock is count for socket hooks, which have no packet. */
+static __always_inline void count_sock(__u32 ifindex, __u8 dir, __u8 reason)
+{
+	add_metric(ifindex, dir, reason, 0);
 }
 
 static __always_inline struct config *get_config(void)

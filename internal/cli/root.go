@@ -34,7 +34,7 @@ func NewRoot() *cobra.Command {
 		runCmd(), createCmd(), startCmd(), stopCmd(), killCmd(), restartCmd(), rmCmd(),
 		psCmd(), execCmd(), logsCmd(), inspectCmd(), portCmd(),
 		pullCmd(), imagesCmd(), rmiCmd(),
-		networkCmd(), systemCmd(), versionCmd(), probeCmd(),
+		networkCmd(), netCmd(), systemCmd(), versionCmd(), probeCmd(),
 	)
 	return root
 }

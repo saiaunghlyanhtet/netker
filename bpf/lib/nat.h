@@ -29,7 +29,10 @@ static __always_inline void snat_keys(struct nat_key *out, struct nat_key *in,
 /* snat_lookup_or_alloc returns the masquerade address/port for a container
  * flow, allocating a port for new flows. Returns NULL when no port is free.
  */
-static __always_inline struct nat_val *
+/* Not inlined: its keys and values would otherwise sit in the caller's
+ * frame, and the verifier limits the whole call chain to 512 bytes.
+ */
+static __attribute__((noinline)) struct nat_val *
 snat_lookup_or_alloc(const struct l4 *l, __be32 ctr_addr, __be32 remote, __be32 nat_addr,
 		     __u32 ctr_ifindex)
 {
