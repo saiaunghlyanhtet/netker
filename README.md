@@ -47,6 +47,8 @@ Commands: `run create start stop restart kill rm ps exec logs inspect port`,
 
 ```sh
 sudo bin/netker system datapath status    # pinned links, endpoint map, counters per verdict
+sudo bin/netker net trace --drops         # every packet the datapath drops, and why
+sudo bin/netker net trace web             # every verdict for one container (forward, NAT, deliver, drop)
 sudo bin/netker system datapath upgrade   # swap every container's programs atomically
                                           # (run after upgrading netker; see below)
 sudo bin/netker system datapath sync      # attach to uplinks that appeared since

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
@@ -1095,5 +1096,181 @@ func TestEBPFMapLayoutChange(t *testing.T) {
 	}
 	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
 		t.Fatalf("A->B after a second rebuild: %q, %v", got, err)
+	}
+}
+
+// collectEvents runs a tracer until the test ends and returns its events.
+func collectEvents(t *testing.T, s *Store, opts datapath.TraceOptions) <-chan datapath.Event {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan datapath.Event, 1024)
+	done := make(chan error, 1)
+	// A Datapath of its own, like a separate "netker net trace" process.
+	dp := datapath.New(os.Getenv("NETKER_BPFFS"))
+	go func() {
+		done <- dp.Trace(ctx, opts, func(ev datapath.Event) bool {
+			select {
+			case ch <- ev:
+			default:
+			}
+			return true
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("trace: %v", err)
+		}
+		dp.Close()
+	})
+	return ch
+}
+
+// waitEvent repeats trigger until an event matching ok arrives.
+func waitEvent(t *testing.T, ch <-chan datapath.Event, trigger func(), ok func(datapath.Event) bool) datapath.Event {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		trigger()
+		for {
+			select {
+			case ev := <-ch:
+				if ok(ev) {
+					return ev
+				}
+				continue
+			case <-deadline:
+				t.Fatal("no matching event")
+			case <-time.After(300 * time.Millisecond):
+			}
+			break
+		}
+	}
+}
+
+func TestEBPFTraceDrops(t *testing.T) {
+	s, _ := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	epA, nsA := attachT(t, s, n, "a81a81a81a81a81a")
+	epB, nsB := attachT(t, s, n, "b81b81b81b81b81b")
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	spoofed := netip.MustParseAddr("10.87.200.201")
+	err := netns.Do(nsA, func() error {
+		l, err := netlink.LinkByName("eth0")
+		if err != nil {
+			return err
+		}
+		return netlink.AddrAdd(l, &netlink.Addr{IPNet: hostNet(spoofed)})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(t, s, datapath.TraceOptions{})
+	ev := waitEvent(t, events, func() {
+		netns.Do(nsA, func() error {
+			d := net.Dialer{Timeout: 200 * time.Millisecond, LocalAddr: &net.TCPAddr{IP: net.IP(spoofed.AsSlice())}}
+			if c, err := d.Dial("tcp4", epB.IP.String()+":9000"); err == nil {
+				c.Close()
+			}
+			return nil
+		})
+	}, func(ev datapath.Event) bool { return ev.Reason == "drop-spoof" })
+
+	if !ev.Drop || ev.Direction != "egress" || ev.Ifindex != uint32(epA.HostIfIndex) || ev.Proto != "tcp" ||
+		ev.Src.Addr() != spoofed || ev.Dst != netip.AddrPortFrom(epB.IP, 9000) {
+		t.Fatalf("drop event %+v", ev)
+	}
+	if time.Since(ev.Time) > 10*time.Second || time.Until(ev.Time) > time.Second {
+		t.Fatalf("event time %v is off", ev.Time)
+	}
+
+	// Tracing only B still shows the packet A tried to send to B: the drop
+	// happens on A's device, but its destination is B.
+	onlyB := collectEvents(t, s, datapath.TraceOptions{
+		Ifindexes: []uint32{uint32(epB.HostIfIndex)}, Addrs: []netip.Addr{epB.IP},
+	})
+	ev = waitEvent(t, onlyB, func() {
+		netns.Do(nsA, func() error {
+			d := net.Dialer{Timeout: 200 * time.Millisecond, LocalAddr: &net.TCPAddr{IP: net.IP(spoofed.AsSlice())}}
+			if c, err := d.Dial("tcp4", epB.IP.String()+":9000"); err == nil {
+				c.Close()
+			}
+			return nil
+		})
+	}, func(ev datapath.Event) bool { return ev.Reason == "drop-spoof" })
+	if ev.Ifindex != uint32(epA.HostIfIndex) || ev.Dst.Addr() != epB.IP {
+		t.Fatalf("drop towards the traced container: %+v", ev)
+	}
+}
+
+func TestEBPFTraceVerdicts(t *testing.T) {
+	s, _ := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	epA, nsA := attachT(t, s, n, "a82a82a82a82a82a")
+	epB, nsB := attachT(t, s, n, "b82b82b82b82b82b")
+	listenIn(t, nsB, epB.IP.String()+":9000")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dp := datapath.New(os.Getenv("NETKER_BPFFS"))
+	defer dp.Close()
+	ch := make(chan datapath.Event, 1024)
+	done := make(chan error, 1)
+	go func() {
+		done <- dp.Trace(ctx, datapath.TraceOptions{All: true, Ifindexes: []uint32{uint32(epA.HostIfIndex)}}, func(ev datapath.Event) bool {
+			select {
+			case ch <- ev:
+			default:
+			}
+			return true
+		})
+	}()
+
+	ev := waitEvent(t, ch, func() { dialIn(nsA, epB.IP.String()+":9000") },
+		func(ev datapath.Event) bool { return ev.Reason == "forward-local" })
+	if ev.Drop || ev.Ifindex != uint32(epA.HostIfIndex) || ev.Proto != "tcp" ||
+		ev.Src.Addr() != epA.IP || ev.Dst != netip.AddrPortFrom(epB.IP, 9000) {
+		t.Fatalf("trace event %+v", ev)
+	}
+	if active, err := s.dp.TraceActive(); err != nil || !active {
+		t.Fatalf("tracing not active while a tracer runs: %v, %v", active, err)
+	}
+	// B's replies happen on B's device, which isn't traced.
+	time.Sleep(300 * time.Millisecond)
+	for len(ch) > 0 {
+		if ev := <-ch; ev.Ifindex == uint32(epB.HostIfIndex) {
+			t.Fatalf("event from a device outside the filter: %+v", ev)
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if active, _ := s.dp.TraceActive(); active {
+		t.Fatal("tracing still on after the tracer stopped")
+	}
+}
+
+// TestEBPFTraceStopsWithoutTraffic: cancelling must not wait for another
+// event (a blocked perf read used to keep "netker net trace" running after
+// Ctrl-C until the next packet).
+func TestEBPFTraceStopsWithoutTraffic(t *testing.T) {
+	ebpfStore(t)
+	dp := datapath.New(os.Getenv("NETKER_BPFFS"))
+	defer dp.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- dp.Trace(ctx, datapath.TraceOptions{All: true}, func(datapath.Event) bool { return true })
+	}()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Trace didn't return after cancel on a quiet datapath")
 	}
 }

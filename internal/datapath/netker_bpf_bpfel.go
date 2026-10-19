@@ -31,6 +31,11 @@ type netkerEndpoint struct {
 	PeerMac     [6]uint8
 }
 
+type netkerFibScratch struct {
+	_   structs.HostLayout
+	Buf [64]uint8
+}
+
 type netkerIp6Key struct {
 	_    structs.HostLayout
 	Addr [16]uint8
@@ -121,6 +126,13 @@ type netkerPortVal struct {
 	Ifindex uint32
 }
 
+type netkerTraceCfg struct {
+	_       structs.HostLayout
+	UntilNs uint64
+	Flags   uint32
+	Pad     uint32
+}
+
 // loadNetker returns the embedded CollectionSpec for netker.
 func loadNetker() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_NetkerBytes)
@@ -175,14 +187,18 @@ type netkerProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type netkerMapSpecs struct {
-	NetkerConfig     *ebpf.MapSpec `ebpf:"netker_config"`
-	NetkerEndpoints  *ebpf.MapSpec `ebpf:"netker_endpoints"`
-	NetkerEndpoints6 *ebpf.MapSpec `ebpf:"netker_endpoints6"`
-	NetkerMetrics    *ebpf.MapSpec `ebpf:"netker_metrics"`
-	NetkerNat        *ebpf.MapSpec `ebpf:"netker_nat"`
-	NetkerNat6       *ebpf.MapSpec `ebpf:"netker_nat6"`
-	NetkerPorts      *ebpf.MapSpec `ebpf:"netker_ports"`
-	NetkerPorts6     *ebpf.MapSpec `ebpf:"netker_ports6"`
+	NetkerConfig       *ebpf.MapSpec `ebpf:"netker_config"`
+	NetkerEndpoints    *ebpf.MapSpec `ebpf:"netker_endpoints"`
+	NetkerEndpoints6   *ebpf.MapSpec `ebpf:"netker_endpoints6"`
+	NetkerEvents       *ebpf.MapSpec `ebpf:"netker_events"`
+	NetkerMetrics      *ebpf.MapSpec `ebpf:"netker_metrics"`
+	NetkerNat          *ebpf.MapSpec `ebpf:"netker_nat"`
+	NetkerNat6         *ebpf.MapSpec `ebpf:"netker_nat6"`
+	NetkerPorts        *ebpf.MapSpec `ebpf:"netker_ports"`
+	NetkerPorts6       *ebpf.MapSpec `ebpf:"netker_ports6"`
+	NetkerScratchFib   *ebpf.MapSpec `ebpf:"netker_scratch_fib"`
+	NetkerTrace        *ebpf.MapSpec `ebpf:"netker_trace"`
+	NetkerTraceIfindex *ebpf.MapSpec `ebpf:"netker_trace_ifindex"`
 }
 
 // netkerVariableSpecs contains global variables before they are loaded into the kernel.
@@ -211,14 +227,18 @@ func (o *netkerObjects) Close() error {
 //
 // It can be passed to loadNetkerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type netkerMaps struct {
-	NetkerConfig     *ebpf.Map `ebpf:"netker_config"`
-	NetkerEndpoints  *ebpf.Map `ebpf:"netker_endpoints"`
-	NetkerEndpoints6 *ebpf.Map `ebpf:"netker_endpoints6"`
-	NetkerMetrics    *ebpf.Map `ebpf:"netker_metrics"`
-	NetkerNat        *ebpf.Map `ebpf:"netker_nat"`
-	NetkerNat6       *ebpf.Map `ebpf:"netker_nat6"`
-	NetkerPorts      *ebpf.Map `ebpf:"netker_ports"`
-	NetkerPorts6     *ebpf.Map `ebpf:"netker_ports6"`
+	NetkerConfig       *ebpf.Map `ebpf:"netker_config"`
+	NetkerEndpoints    *ebpf.Map `ebpf:"netker_endpoints"`
+	NetkerEndpoints6   *ebpf.Map `ebpf:"netker_endpoints6"`
+	NetkerEvents       *ebpf.Map `ebpf:"netker_events"`
+	NetkerMetrics      *ebpf.Map `ebpf:"netker_metrics"`
+	NetkerNat          *ebpf.Map `ebpf:"netker_nat"`
+	NetkerNat6         *ebpf.Map `ebpf:"netker_nat6"`
+	NetkerPorts        *ebpf.Map `ebpf:"netker_ports"`
+	NetkerPorts6       *ebpf.Map `ebpf:"netker_ports6"`
+	NetkerScratchFib   *ebpf.Map `ebpf:"netker_scratch_fib"`
+	NetkerTrace        *ebpf.Map `ebpf:"netker_trace"`
+	NetkerTraceIfindex *ebpf.Map `ebpf:"netker_trace_ifindex"`
 }
 
 func (m *netkerMaps) Close() error {
@@ -226,11 +246,15 @@ func (m *netkerMaps) Close() error {
 		m.NetkerConfig,
 		m.NetkerEndpoints,
 		m.NetkerEndpoints6,
+		m.NetkerEvents,
 		m.NetkerMetrics,
 		m.NetkerNat,
 		m.NetkerNat6,
 		m.NetkerPorts,
 		m.NetkerPorts6,
+		m.NetkerScratchFib,
+		m.NetkerTrace,
+		m.NetkerTraceIfindex,
 	)
 }
 

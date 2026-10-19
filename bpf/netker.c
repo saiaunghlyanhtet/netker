@@ -43,7 +43,7 @@ static __always_inline bool is_mcast_or_bcast(__be32 addr)
  * netkit switches into the container's netns. bpf_redirect_peer() isn't
  * usable here: it needs tc ingress, and this runs on netkit's xmit path.
  */
-static __always_inline int to_local(struct __sk_buff *skb, __u32 self, struct endpoint *dst, __u8 reason, bool v6)
+static __attribute__((noinline)) int to_local(struct __sk_buff *skb, __u32 self, struct endpoint *dst, __u8 reason, bool v6)
 {
 	__u32 dst_ifindex = dst->ifindex;
 	__u8 macs[12];
@@ -51,14 +51,14 @@ static __always_inline int to_local(struct __sk_buff *skb, __u32 self, struct en
 	__builtin_memcpy(macs, dst->peer_mac, 6);
 	__builtin_memcpy(macs + 6, dst->mac, 6);
 	if ((v6 ? dec_hoplimit(skb) : dec_ttl(skb)) < 0) {
-		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 		return NETKIT_PASS;
 	}
 	if (bpf_skb_store_bytes(skb, 0, macs, sizeof(macs), 0) < 0) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
-	count(self, DIR_EGRESS, reason, skb->len);
+	count(skb, self, DIR_EGRESS, reason);
 	return bpf_redirect(dst_ifindex, 0);
 }
 
@@ -92,21 +92,21 @@ static __always_inline int from_container_arp(struct __sk_buff *skb, struct ethh
 	struct arp_eth arp;
 
 	if (bpf_skb_load_bytes(skb, ETH_HLEN, &arp, sizeof(arp)) < 0) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
 	__be32 sip = arp.sip;
 	struct endpoint *ep = bpf_map_lookup_elem(&netker_endpoints, &sip);
 	if (!ep || ep->ifindex != self) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF);
 		return NETKIT_DROP;
 	}
 	if ((ep->flags & EP_F_L2) &&
 	    (!mac_eq(arp.sha, ep->peer_mac) || !mac_eq(eth->h_source, ep->peer_mac))) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF_MAC);
 		return NETKIT_DROP;
 	}
-	count(self, DIR_EGRESS, REASON_PASS_ARP, skb->len);
+	count(skb, self, DIR_EGRESS, REASON_PASS_ARP);
 	return NETKIT_PASS;
 }
 
@@ -130,12 +130,12 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 	struct l4 l = {};
 
 	if ((void *)(ip6 + 1) > data_end) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
 	/* E.g. the container's MLD reports for its solicited-node groups. */
 	if (ip6_is_mcast(&ip6->daddr)) {
-		count(self, DIR_EGRESS, REASON_DROP_MCAST, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MCAST);
 		return NETKIT_DROP;
 	}
 	__u8 saddr[16], daddr[16];
@@ -144,11 +144,11 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 
 	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints6, saddr);
 	if (!src || src->ifindex != self) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF);
 		return NETKIT_DROP;
 	}
 	if ((src->flags & EP_F_L2) && !mac_eq(eth->h_source, src->peer_mac)) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF_MAC);
 		return NETKIT_DROP;
 	}
 	__u32 src_netid = src->netid;
@@ -168,7 +168,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 			__builtin_memcpy(orig, v->addr, 16);
 			if (rewrite_port(skb, &l, true, l.sport, orig_port) < 0 ||
 			    rewrite_addr6(skb, &l, true, saddr, orig) < 0) {
-				count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+				count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 				return NETKIT_DROP;
 			}
 			__builtin_memcpy(saddr, orig, 16);
@@ -180,23 +180,26 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, daddr);
 	if (dst) {
 		if (!rev_dnat && dst->netid != src_netid) {
-			count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_POLICY);
 			return NETKIT_DROP;
 		}
 		if (!rev_dnat && (src_flags & EP_F_NO_ICC)) {
-			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_ICC);
 			return NETKIT_DROP;
 		}
 		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL, true);
 	}
 
-	struct bpf_fib_lookup fib = {
-		.family = AF_INET6,
-		.ifindex = self,
-	};
-	__builtin_memcpy(fib.ipv6_src, saddr, 16);
-	__builtin_memcpy(fib.ipv6_dst, daddr, 16);
-	long rc = bpf_fib_lookup(skb, &fib, sizeof(fib), BPF_FIB_LOOKUP_SRC);
+	struct bpf_fib_lookup *fib = scratch_fib();
+	if (!fib) {
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
+		return NETKIT_PASS;
+	}
+	fib->family = AF_INET6;
+	fib->ifindex = self;
+	__builtin_memcpy(fib->ipv6_src, saddr, 16);
+	__builtin_memcpy(fib->ipv6_dst, daddr, 16);
+	long rc = bpf_fib_lookup(skb, fib, sizeof(*fib), BPF_FIB_LOOKUP_SRC);
 
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED && rev_dnat) {
 		/* Reply to the host's connection to its own address: back
@@ -204,10 +207,10 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 		 */
 		__u8 zero_mac[6] = {};
 		if (bpf_skb_store_bytes(skb, 0, zero_mac, sizeof(zero_mac), 0) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
-		count(self, DIR_EGRESS, REASON_REV_DNAT, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_REV_DNAT);
 		return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
 	}
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
@@ -216,7 +219,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 		if (has_l4 && !l.is_echo)
 			pv = lookup_port6(daddr, l.dport, l.proto, true);
 		if (!pv) {
-			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 			return NETKIT_PASS;
 		}
 		__u8 ctr[16];
@@ -230,54 +233,54 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 		if (bpf_map_update_elem(&netker_nat6, &k, &v, BPF_ANY) != 0 ||
 		    rewrite_port(skb, &l, false, l.dport, ctr_port) < 0 ||
 		    rewrite_addr6(skb, &l, false, daddr, ctr) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
 		dst = bpf_map_lookup_elem(&netker_endpoints6, ctr);
 		if (!dst) {
-			count(self, DIR_EGRESS, REASON_DROP_NOT_OURS, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_NOT_OURS);
 			return NETKIT_DROP;
 		}
 		return to_local(skb, self, dst, REASON_DNAT, true);
 	}
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
-		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 		return NETKIT_PASS;
 	}
 
 	/* Out through an uplink. */
 	if (src_flags & EP_F_INTERNAL) {
-		count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_POLICY);
 		return NETKIT_DROP;
 	}
-	__u32 out_ifindex = fib.ifindex;
+	__u32 out_ifindex = fib->ifindex;
 	if (!rev_dnat) {
 		__u8 nat_addr[16];
-		__builtin_memcpy(nat_addr, fib.ipv6_src, 16);
+		__builtin_memcpy(nat_addr, fib->ipv6_src, 16);
 		if (!has_l4 || addr6_is_zero(nat_addr)) {
 			/* Extension headers, fragments, other protocols: the
 			 * host stack and nftables masquerade handle it.
 			 */
-			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 			return NETKIT_PASS;
 		}
 		struct nat6_val *nv = snat6_lookup_or_alloc(&l, saddr, daddr, nat_addr, self);
 		if (!nv) {
-			count(self, DIR_EGRESS, REASON_DROP_NAT_EXHAUSTED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_NAT_EXHAUSTED);
 			return NETKIT_DROP;
 		}
 		__be16 nat_port = nv->port;
 		if (rewrite_port(skb, &l, true, l.sport, nat_port) < 0 ||
 		    rewrite_addr6(skb, &l, true, saddr, nat_addr) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
 	}
 	if (dec_hoplimit(skb) < 0) {
-		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 		return NETKIT_PASS;
 	}
-	count(self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT, skb->len);
+	count(skb, self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT);
 	return bpf_redirect_neigh(out_ifindex, NULL, 0, 0);
 }
 
@@ -290,17 +293,17 @@ static __always_inline int to_container6(struct __sk_buff *skb, struct ethhdr *e
 	if ((void *)(ip6 + 1) > data_end)
 		return NETKIT_DROP;
 	if (ip6_is_mcast(&ip6->daddr)) {
-		count(0, DIR_INGRESS, REASON_DROP_MCAST, skb->len);
+		count(skb, 0, DIR_INGRESS, REASON_DROP_MCAST);
 		return NETKIT_DROP;
 	}
 	struct ip6_key dkey;
 	__builtin_memcpy(dkey.addr, &ip6->daddr, 16);
 	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints6, &dkey);
 	if (!dst || dst->peer_ifindex != self_peer) {
-		count(dst ? dst->ifindex : 0, DIR_INGRESS, REASON_DROP_NOT_OURS, skb->len);
+		count(skb, dst ? dst->ifindex : 0, DIR_INGRESS, REASON_DROP_NOT_OURS);
 		return NETKIT_DROP;
 	}
-	count(dst->ifindex, DIR_INGRESS, REASON_DELIVER, skb->len);
+	count(skb, dst->ifindex, DIR_INGRESS, REASON_DELIVER);
 	return NETKIT_PASS;
 }
 
@@ -316,26 +319,26 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 	struct l4 l = {};
 
 	if ((void *)(eth + 1) > data_end) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
 	struct iphdr *ip = (void *)(eth + 1);
 	if ((void *)(ip + 1) > data_end) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
 
 	__be32 saddr = ip->saddr, daddr = ip->daddr;
 	struct endpoint *src = bpf_map_lookup_elem(&netker_endpoints, &saddr);
 	if (!src || src->ifindex != self) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF);
 		return NETKIT_DROP;
 	}
 	/* On L2 networks the container could change its MAC (netkit allows
 	 * live address changes); only its recorded MAC may send.
 	 */
 	if ((src->flags & EP_F_L2) && !mac_eq(eth->h_source, src->peer_mac)) {
-		count(self, DIR_EGRESS, REASON_DROP_SPOOF_MAC, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_SPOOF_MAC);
 		return NETKIT_DROP;
 	}
 	__u32 src_netid = src->netid;
@@ -358,7 +361,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 			__be16 orig_port = v->port;
 			if (rewrite_port(skb, &l, true, l.sport, orig_port) < 0 ||
 			    rewrite_addr(skb, &l, true, saddr, orig_addr) < 0) {
-				count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+				count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 				return NETKIT_DROP;
 			}
 			saddr = orig_addr;
@@ -373,7 +376,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 		 * connected to a host address, not to this container.
 		 */
 		if (!rev_dnat && dst->netid != src_netid) {
-			count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_POLICY);
 			return NETKIT_DROP;
 		}
 		/* --icc=false: no direct traffic between the network's
@@ -381,19 +384,22 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 		 * replies stay reachable, as they were exposed on purpose.
 		 */
 		if (!rev_dnat && no_icc) {
-			count(self, DIR_EGRESS, REASON_DROP_ICC, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_ICC);
 			return NETKIT_DROP;
 		}
 		return to_local(skb, self, dst, rev_dnat ? REASON_REV_DNAT : REASON_FORWARD_LOCAL, false);
 	}
 
-	struct bpf_fib_lookup fib = {
-		.family = AF_INET,
-		.ifindex = self,
-		.ipv4_src = saddr,
-		.ipv4_dst = daddr,
-	};
-	long rc = bpf_fib_lookup(skb, &fib, sizeof(fib), BPF_FIB_LOOKUP_SRC);
+	struct bpf_fib_lookup *fib = scratch_fib();
+	if (!fib) {
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
+		return NETKIT_PASS;
+	}
+	fib->family = AF_INET;
+	fib->ifindex = self;
+	fib->ipv4_src = saddr;
+	fib->ipv4_dst = daddr;
+	long rc = bpf_fib_lookup(skb, fib, sizeof(*fib), BPF_FIB_LOOKUP_SRC);
 
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED && rev_dnat) {
 		/* Reply to the host itself, which connected to one of its own
@@ -403,10 +409,10 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 		 */
 		__u8 zero_mac[6] = {};
 		if (bpf_skb_store_bytes(skb, 0, zero_mac, sizeof(zero_mac), 0) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
-		count(self, DIR_EGRESS, REASON_REV_DNAT, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_REV_DNAT);
 		return bpf_redirect(LOOPBACK_IFINDEX, BPF_F_INGRESS);
 	}
 	if (rc == BPF_FIB_LKUP_RET_NOT_FWDED) {
@@ -417,7 +423,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 		if (has_l4 && !rev_dnat && !is_mcast_or_bcast(daddr))
 			pv = lookup_port(daddr, l.dport, l.proto, true);
 		if (!pv) {
-			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 			return NETKIT_PASS;
 		}
 		__be32 ctr_addr = pv->ctr_addr;
@@ -430,54 +436,54 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 		if (bpf_map_update_elem(&netker_nat, &k, &v, BPF_ANY) != 0 ||
 		    rewrite_port(skb, &l, false, l.dport, ctr_port) < 0 ||
 		    rewrite_addr(skb, &l, false, daddr, ctr_addr) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
 		dst = bpf_map_lookup_elem(&netker_endpoints, &ctr_addr);
 		if (!dst) {
-			count(self, DIR_EGRESS, REASON_DROP_NOT_OURS, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_NOT_OURS);
 			return NETKIT_DROP;
 		}
 		return to_local(skb, self, dst, REASON_DNAT, false);
 	}
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/* Unreachable, prohibited, ...: the stack answers with ICMP. */
-		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 		return NETKIT_PASS;
 	}
 
 	/* Out through an uplink. */
 	if (internal) {
-		count(self, DIR_EGRESS, REASON_DROP_POLICY, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_POLICY);
 		return NETKIT_DROP;
 	}
-	__u32 out_ifindex = fib.ifindex;
+	__u32 out_ifindex = fib->ifindex;
 	if (!rev_dnat) {
-		if (!has_l4 || !fib.ipv4_src) {
+		if (!has_l4 || !fib->ipv4_src) {
 			/* Fragments, other protocols, or no source address on
 			 * the uplink: the stack and nftables masquerade handle it.
 			 */
-			count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 			return NETKIT_PASS;
 		}
-		struct nat_val *nv = snat_lookup_or_alloc(&l, saddr, daddr, fib.ipv4_src, self);
+		struct nat_val *nv = snat_lookup_or_alloc(&l, saddr, daddr, fib->ipv4_src, self);
 		if (!nv) {
-			count(self, DIR_EGRESS, REASON_DROP_NAT_EXHAUSTED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_NAT_EXHAUSTED);
 			return NETKIT_DROP;
 		}
 		__be32 nat_addr = nv->addr;
 		__be16 nat_port = nv->port;
 		if (rewrite_port(skb, &l, true, l.sport, nat_port) < 0 ||
 		    rewrite_addr(skb, &l, true, saddr, nat_addr) < 0) {
-			count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+			count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 			return NETKIT_DROP;
 		}
 	}
 	if (dec_ttl(skb) < 0) {
-		count(self, DIR_EGRESS, REASON_PASS_STACK, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
 		return NETKIT_PASS;
 	}
-	count(self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT, skb->len);
+	count(skb, self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT);
 	/* The neighbour subsystem resolves the next hop and fills in the MACs. */
 	return bpf_redirect_neigh(out_ifindex, NULL, 0, 0);
 }
@@ -491,7 +497,7 @@ int nk_from_container(struct __sk_buff *skb)
 	__u32 self = skb->ifindex;
 
 	if ((void *)(eth + 1) > data_end) {
-		count(self, DIR_EGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
 		return NETKIT_DROP;
 	}
 	switch (eth->h_proto) {
@@ -502,7 +508,7 @@ int nk_from_container(struct __sk_buff *skb)
 	case bpf_htons(ETH_P_IPV6):
 		return from_container6(skb, self);
 	}
-	count(self, DIR_EGRESS, REASON_DROP_PROTO, skb->len);
+	count(skb, self, DIR_EGRESS, REASON_DROP_PROTO);
 	return NETKIT_DROP;
 }
 
@@ -529,15 +535,15 @@ int nk_to_container(struct __sk_buff *skb)
 
 	__be32 daddr = ip->daddr;
 	if (is_mcast_or_bcast(daddr)) {
-		count(0, DIR_INGRESS, REASON_DROP_MCAST, skb->len);
+		count(skb, 0, DIR_INGRESS, REASON_DROP_MCAST);
 		return NETKIT_DROP;
 	}
 	struct endpoint *dst = bpf_map_lookup_elem(&netker_endpoints, &daddr);
 	if (!dst || dst->peer_ifindex != self_peer) {
-		count(dst ? dst->ifindex : 0, DIR_INGRESS, REASON_DROP_NOT_OURS, skb->len);
+		count(skb, dst ? dst->ifindex : 0, DIR_INGRESS, REASON_DROP_NOT_OURS);
 		return NETKIT_DROP;
 	}
-	count(dst->ifindex, DIR_INGRESS, REASON_DELIVER, skb->len);
+	count(skb, dst->ifindex, DIR_INGRESS, REASON_DELIVER);
 	return NETKIT_PASS;
 }
 
@@ -629,12 +635,12 @@ static __attribute__((noinline)) int host_ingress(struct __sk_buff *skb, bool on
 	}
 	if (rewrite_port(skb, &l, false, l.dport, new_port) < 0 ||
 	    rewrite_addr(skb, &l, false, daddr, new_addr) < 0) {
-		count(ifindex, DIR_INGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, ifindex, DIR_INGRESS, REASON_DROP_MALFORMED);
 		return TCX_DROP;
 	}
 	if (!on_lo && dec_ttl(skb) < 0)
 		return TCX_NEXT;
-	count(ifindex, DIR_INGRESS, reason, skb->len);
+	count(skb, ifindex, DIR_INGRESS, reason);
 	/* Straight into the container's netns: tc ingress -> peer ingress, no
 	 * backlog queue and no host stack.
 	 */
@@ -727,12 +733,12 @@ static __attribute__((noinline)) int host_ingress6(struct __sk_buff *skb, bool o
 	}
 	if (rewrite_port(skb, &l, false, l.dport, new_port) < 0 ||
 	    rewrite_addr6(skb, &l, false, daddr, new_addr) < 0) {
-		count(ifindex, DIR_INGRESS, REASON_DROP_MALFORMED, skb->len);
+		count(skb, ifindex, DIR_INGRESS, REASON_DROP_MALFORMED);
 		return TCX_DROP;
 	}
 	if (!on_lo && dec_hoplimit(skb) < 0)
 		return TCX_NEXT;
-	count(ifindex, DIR_INGRESS, reason, skb->len);
+	count(skb, ifindex, DIR_INGRESS, reason);
 	return bpf_redirect_peer(ifindex, 0);
 }
 
@@ -780,7 +786,7 @@ int nk_sock_connect4(struct bpf_sock_addr *ctx)
 		return 1;
 	ctx->user_ip4 = pv->ctr_addr;
 	ctx->user_port = pv->ctr_port;
-	count(pv->ifindex, DIR_INGRESS, REASON_DNAT, 0);
+	count_sock(pv->ifindex, DIR_INGRESS, REASON_DNAT);
 	return 1;
 }
 
@@ -807,7 +813,7 @@ int nk_sock_connect6(struct bpf_sock_addr *ctx)
 	ctx->user_ip6[2] = ctr[2];
 	ctx->user_ip6[3] = ctr[3];
 	ctx->user_port = pv->ctr_port;
-	count(pv->ifindex, DIR_INGRESS, REASON_DNAT, 0);
+	count_sock(pv->ifindex, DIR_INGRESS, REASON_DNAT);
 	return 1;
 }
 
