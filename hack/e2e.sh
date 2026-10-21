@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web e2e-busy >/dev/null 2>&1 || true
 	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
 		netker network rm "$n" >/dev/null 2>&1 || true
 	done
@@ -43,6 +43,25 @@ echo "$out" | grep -Eq '"rx_bytes": [1-9]' || fail "stats: no received bytes for
 echo "$out" | grep -Eq '"tx_bytes": [1-9]' || fail "stats: no sent bytes for e2e-web: $out"
 echo "ok: stats: network counters for a running container"
 expect "stats: --net shows the interface and network" "eth0" "$(netker stats --no-stream --net e2e-web)"
+if [[ "${NETKER_CGROUP_MANAGER:-}" == disabled ]]; then
+	# No cgroup per container: usage would be the sandbox's, so none is shown.
+	if netker stats --no-stream --format json e2e-web | grep -q '"resources"'; then
+		fail "stats: resource usage shown without a cgroup of the container's own"
+	fi
+	echo "ok: stats: no CPU/memory without a cgroup of the container's own"
+else
+	netker run -d --name e2e-busy alpine sh -c 'while :; do :; done' >/dev/null
+	sleep 1
+	out=$(netker stats --no-stream --format json e2e-busy)
+	cpu=$(echo "$out" | grep -Eo '"cpu_percent": [0-9.]+' | awk '{print $2}')
+	awk -v c="$cpu" 'BEGIN { exit !(c > 20) }' || fail "stats: busy loop at ${cpu}% CPU: $out"
+	echo "ok: stats: a busy container shows ${cpu}% CPU"
+	echo "$out" | grep -Eq '"mem_usage": [1-9]' || fail "stats: no memory usage: $out"
+	echo "$out" | grep -Eq '"pids": [1-9]' || fail "stats: no processes: $out"
+	echo "ok: stats: memory usage and PIDs from the container's cgroup"
+	expect "stats: table has the CPU and memory columns" "MEM USAGE / LIMIT" "$(netker stats --no-stream e2e-busy)"
+	netker rm -f e2e-busy >/dev/null
+fi
 expect "names: a new container reaches e2e-web by name" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- http://e2e-web/)"
 netker run -d --name e2e-peer alpine sleep 300 >/dev/null
 expect "names: a running container learns a peer started later" "e2e-peer" "$(netker exec e2e-web cat /etc/hosts)"
