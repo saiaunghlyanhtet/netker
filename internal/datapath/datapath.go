@@ -459,10 +459,14 @@ var Reasons = map[uint8]string{
 	15: "drop-nat-exhausted", 16: "drop-mcast", 17: "drop-icc", 18: "drop-spoof-mac",
 }
 
+// isDrop mirrors is_drop() in bpf/lib/maps.h: drop reasons start at 10.
+func isDrop(reason uint8) bool { return reason >= 10 }
+
 type Metric struct {
 	Ifindex   uint32 `json:"ifindex"`
 	Direction string `json:"direction"`
 	Reason    string `json:"reason"`
+	Drop      bool   `json:"drop"`
 	Packets   uint64 `json:"packets"`
 	Bytes     uint64 `json:"bytes"`
 }
@@ -477,7 +481,7 @@ func (d *Datapath) Metrics() ([]Metric, error) {
 	var vals []netkerMetricsVal
 	it := d.objs.NetkerMetrics.Iterate()
 	for it.Next(&key, &vals) {
-		m := Metric{Ifindex: key.Ifindex, Direction: "egress", Reason: Reasons[key.Reason]}
+		m := Metric{Ifindex: key.Ifindex, Direction: "egress", Reason: Reasons[key.Reason], Drop: isDrop(key.Reason)}
 		if key.Dir == 1 {
 			m.Direction = "ingress"
 		}

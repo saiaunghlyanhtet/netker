@@ -41,7 +41,7 @@ sudo bin/netker network create --subnet 10.97.0.0/24 --subnet fd00:97::/64 dual 
 sudo bin/netker rm -f web
 ```
 
-Commands: `run create start stop restart kill rm ps exec logs inspect port`,
+Commands: `run create start stop restart kill rm ps exec logs inspect port stats`,
 `pull images rmi`, `network create|ls|rm|inspect|connect|disconnect`, `system check|gc`,
 `system datapath status|upgrade`, `version`.
 
@@ -49,6 +49,8 @@ Commands: `run create start stop restart kill rm ps exec logs inspect port`,
 sudo bin/netker system datapath status    # pinned links, endpoint map, counters per verdict
 sudo bin/netker net trace --drops         # every packet the datapath drops, and why
 sudo bin/netker net trace web             # every verdict for one container (forward, NAT, deliver, drop)
+sudo bin/netker stats                     # live per-container usage (--no-stream for one sample)
+sudo bin/netker stats --net web           # per-interface counters, drops by reason
 sudo bin/netker system datapath upgrade   # swap every container's programs atomically
                                           # (run after upgrading netker; see below)
 sudo bin/netker system datapath sync      # attach to uplinks that appeared since

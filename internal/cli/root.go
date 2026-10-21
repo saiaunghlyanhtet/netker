@@ -32,7 +32,7 @@ func NewRoot() *cobra.Command {
 	}
 	root.AddCommand(
 		runCmd(), createCmd(), startCmd(), stopCmd(), killCmd(), restartCmd(), rmCmd(),
-		psCmd(), execCmd(), logsCmd(), inspectCmd(), portCmd(),
+		psCmd(), execCmd(), logsCmd(), inspectCmd(), portCmd(), statsCmd(),
 		pullCmd(), imagesCmd(), rmiCmd(),
 		networkCmd(), netCmd(), systemCmd(), versionCmd(), probeCmd(),
 	)
