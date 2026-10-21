@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-v6a e2e-v6web >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web >/dev/null 2>&1 || true
 	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
 		netker network rm "$n" >/dev/null 2>&1 || true
 	done
@@ -38,6 +38,11 @@ expect "container side is eth0 in L3 mode" "NOARP" "$(netker exec e2e-web ip lin
 
 expect "host -> container" "hello from" "$(curl -s --max-time 3 "http://$ip/")"
 expect "container -> container" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- "http://$ip/")"
+out=$(netker stats --no-stream --format json e2e-web)
+echo "$out" | grep -Eq '"rx_bytes": [1-9]' || fail "stats: no received bytes for e2e-web: $out"
+echo "$out" | grep -Eq '"tx_bytes": [1-9]' || fail "stats: no sent bytes for e2e-web: $out"
+echo "ok: stats: network counters for a running container"
+expect "stats: --net shows the interface and network" "eth0" "$(netker stats --no-stream --net e2e-web)"
 expect "names: a new container reaches e2e-web by name" "hello from" "$(timeout 10 netker run --rm alpine wget -T 3 -qO- http://e2e-web/)"
 netker run -d --name e2e-peer alpine sleep 300 >/dev/null
 expect "names: a running container learns a peer started later" "e2e-peer" "$(netker exec e2e-web cat /etc/hosts)"
@@ -121,6 +126,12 @@ if [[ "$datapath" == ebpf ]]; then
 	wait "$tpid" || true
 	expect "trace: --drops reports the --icc=false drop" "drop-icc" "$(cat "$trace_out")"
 	rm -f "$trace_out"
+fi
+if [[ "$datapath" == ebpf ]]; then
+	netker run -d --name e2e-iso2 --network e2e-iso alpine sleep 300 >/dev/null
+	netker exec e2e-iso2 wget -T 1 -qO- "http://$iso1_ip/" >/dev/null 2>&1 || true
+	expect "stats: --net counts the --icc=false drops by reason" "drop-icc=" "$(netker stats --no-stream --net e2e-iso2)"
+	netker rm -f e2e-iso2 >/dev/null
 fi
 expect "icc: published ports stay reachable" "hello from" "$(netker run --rm --network e2e-iso alpine wget -T 3 -qO- http://192.0.2.10:8080/)"
 netker rm -f e2e-iso1 >/dev/null

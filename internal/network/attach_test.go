@@ -581,3 +581,43 @@ func dialIn6(ns, addr string, local ...netip.Addr) (string, error) {
 	})
 	return string(got), err
 }
+
+// TestInterfaceStats runs on whichever datapath is available. On eBPF the
+// traffic is redirected in BPF and never crosses the host stack; the
+// container-side counters must see it anyway.
+func TestInterfaceStats(t *testing.T) {
+	requireNetAdmin(t)
+	s, p := testStore(t)
+	n, _ := s.Get(DefaultName)
+	a, b := "5a5a5a5a5a5a5a5a", "5b5b5b5b5b5b5b5b"
+	nsA, nsB := newNS(t, p, a), newNS(t, p, b)
+	epA, err := s.Attach(n, a, nsA, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epA, a)
+	epB, err := s.Attach(n, b, nsB, 0, netip.Addr{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Detach(epB, b)
+
+	beforeA, err := InterfaceStats(nsA, "eth0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeB, _ := InterfaceStats(nsB, "eth0")
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("A->B: %q, %v", got, err)
+	}
+	afterA, _ := InterfaceStats(nsA, "eth0")
+	afterB, _ := InterfaceStats(nsB, "eth0")
+	// A TCP exchange: SYN, ACK, data and FIN each way at least.
+	if afterA.TxPackets-beforeA.TxPackets < 3 || afterA.RxPackets-beforeA.RxPackets < 3 {
+		t.Fatalf("%s: A sent %d and received %d packets", epA.Datapath, afterA.TxPackets-beforeA.TxPackets, afterA.RxPackets-beforeA.RxPackets)
+	}
+	if afterB.RxBytes-beforeB.RxBytes < 100 || afterB.TxBytes-beforeB.TxBytes < 100 {
+		t.Fatalf("%s: B counters didn't move: %+v -> %+v", epB.Datapath, beforeB, afterB)
+	}
+}
