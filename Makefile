@@ -34,12 +34,20 @@ test-ebpf:
 	docker run --rm --privileged -v $(CURDIR)/bin:/t:ro alpine:latest sh -c \
 		'apk add -q nftables && mount -t bpf bpf /sys/fs/bpf && /t/network.test -test.v -test.count=1 -test.timeout 10m'
 
+# Inside a Docker container the cgroup root holds processes, so cgroup v2
+# won't enable the memory and io controllers for children (the "no
+# internal processes" rule). Move everything into a child first, as
+# Docker-in-Docker setups do, so container stats can be tested.
+CGROUP_DELEGATE = mkdir -p /sys/fs/cgroup/init && \
+	for p in $$(cat /sys/fs/cgroup/cgroup.procs); do echo $$p > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true; done && \
+	echo "+memory +io +pids +cpu" > /sys/fs/cgroup/cgroup.subtree_control
+
 # Full CLI test as real root (eBPF datapath) in a throwaway privileged
 # container. The state dir is a tmpfs because overlayfs can't use Docker's
 # overlay root as its upper layer.
 e2e-root: build
 	docker run --rm --privileged --tmpfs /var/lib/netker -v $(CURDIR):/src:ro -w /src alpine:latest sh -c \
-		'apk add -q bash crun nftables curl iproute2 && mount -t bpf bpf /sys/fs/bpf && \
+		'apk add -q bash crun nftables curl iproute2 && mount -t bpf bpf /sys/fs/bpf && $(CGROUP_DELEGATE) && \
 		 export PATH=/src/bin:$$PATH && netker system check; netker pull alpine >/dev/null && E2E_INTERNET=1 hack/e2e.sh'
 
 # The e2e suite with Ubuntu 24.04's userspace (crun 1.14, iproute2 6.1), as
@@ -47,5 +55,5 @@ e2e-root: build
 e2e-ubuntu: build
 	docker run --rm --privileged --tmpfs /var/lib/netker -v $(CURDIR):/src:ro -w /src ubuntu:24.04 bash -c \
 		'export DEBIAN_FRONTEND=noninteractive && apt-get update -qq >/dev/null && \
-		 apt-get install -y -qq crun nftables curl iproute2 >/dev/null 2>&1 && mount -t bpf bpf /sys/fs/bpf && \
+		 apt-get install -y -qq crun nftables curl iproute2 >/dev/null 2>&1 && mount -t bpf bpf /sys/fs/bpf && $(CGROUP_DELEGATE) && \
 		 export PATH=/src/bin:$$PATH && netker pull alpine >/dev/null && hack/e2e.sh'
