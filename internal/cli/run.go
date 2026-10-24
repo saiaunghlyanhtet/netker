@@ -11,13 +11,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/saiaunghlyanhtet/netker/internal/container"
+	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/idutil"
 	"github.com/saiaunghlyanhtet/netker/internal/network"
 )
 
 type createFlags struct {
 	name, ip, entrypoint, workdir, user, hostname string
-	env, publish, networks                        []string
+	env, publish, networks, hooks                 []string
 	tty, interactive, rm                          bool
 }
 
@@ -36,6 +37,7 @@ func (f *createFlags) register(cmd *cobra.Command) {
 	fl.BoolVarP(&f.tty, "tty", "t", false, "Allocate a pseudo-TTY")
 	fl.BoolVarP(&f.interactive, "interactive", "i", false, "Keep STDIN open")
 	fl.BoolVar(&f.rm, "rm", false, "Remove the container when it exits")
+	fl.StringArrayVar(&f.hooks, "bpf-hook", nil, "Attach a BPF program to the container's netkit devices: egress|ingress[:after]=OBJECT[#PROGRAM]")
 	// -h is taken by --hostname, as in docker.
 	cmd.Flags().Bool("help", false, "Help for "+cmd.Name())
 }
@@ -63,6 +65,13 @@ func (f *createFlags) options(cmd *cobra.Command, args []string) (container.Crea
 			return o, err
 		}
 		o.IP = a
+	}
+	for _, h := range f.hooks {
+		ho, err := parseHook(h)
+		if err != nil {
+			return o, err
+		}
+		o.Hooks = append(o.Hooks, ho)
 	}
 	for _, p := range f.publish {
 		pm, err := parsePort(p)
@@ -258,3 +267,26 @@ func execCmd() *cobra.Command {
 }
 
 func shortID(id string) string { return idutil.Short(id) }
+
+// parseHook reads --bpf-hook egress|ingress[:after]=OBJECT[#PROGRAM].
+func parseHook(s string) (container.HookOptions, error) {
+	var o container.HookOptions
+	where, obj, ok := strings.Cut(s, "=")
+	if !ok || obj == "" {
+		return o, fmt.Errorf("--bpf-hook %q: use egress|ingress[:after]=OBJECT[#PROGRAM]", s)
+	}
+	dir, pos, _ := strings.Cut(where, ":")
+	if dir != datapath.HookEgress && dir != datapath.HookIngress {
+		return o, fmt.Errorf("--bpf-hook %q: direction must be egress or ingress", s)
+	}
+	switch pos {
+	case "", "before":
+	case "after":
+		o.After = true
+	default:
+		return o, fmt.Errorf("--bpf-hook %q: position must be before or after", s)
+	}
+	o.Direction = dir
+	o.Object, o.Program, _ = strings.Cut(obj, "#")
+	return o, nil
+}

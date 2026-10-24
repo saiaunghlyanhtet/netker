@@ -17,6 +17,12 @@
 #define NETKIT_PASS 0
 #define NETKIT_DROP 2
 #define NETKIT_REDIRECT 7
+/* netker's "let it through". NETKIT_NEXT rather than NETKIT_PASS, so user
+ * hooks attached after netker's program (netker net hook add --after) see
+ * the packet too; at the end of the chain netkit treats NEXT as PASS
+ * (netkit_xmit: "case NETKIT_NEXT: case NETKIT_PASS:").
+ */
+#define NK_PASS NETKIT_NEXT
 #define TCX_NEXT -1
 #define TCX_PASS 0
 #define TCX_DROP 2

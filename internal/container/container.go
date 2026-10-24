@@ -37,6 +37,7 @@ type Container struct {
 	Hostname    string                `json:"hostname"`
 	Network     string                `json:"network"` // first network, "host" or "none"
 	Networks    []string              `json:"networks,omitempty"`
+	Hooks       []HookRecord          `json:"hooks,omitempty"`
 	NetNSPath   string                `json:"netns,omitempty"`
 	Endpoints   []*network.Endpoint   `json:"endpoints,omitempty"`
 	Ports       []network.PortMapping `json:"ports,omitempty"`
