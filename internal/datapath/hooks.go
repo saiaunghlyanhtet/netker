@@ -194,3 +194,74 @@ func (d *Datapath) DetachHooks(containerID, hostIf string) error {
 	os.Remove(d.hooksDir(containerID))
 	return errors.Join(errs...)
 }
+
+// HookLink is a pinned hook as found in bpffs.
+type HookLink struct {
+	HostIf    string `json:"host_if"`
+	Direction string `json:"direction"`
+	Name      string `json:"name"`
+	ProgramID uint32 `json:"program_id"`
+	Defunct   bool   `json:"defunct"` // the device is gone
+}
+
+// HookLinks lists the hooks pinned for a container.
+func (d *Datapath) HookLinks(containerID string) ([]HookLink, error) {
+	entries, err := os.ReadDir(d.hooksDir(containerID))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []HookLink
+	for _, e := range entries {
+		// <hostIf>-<direction>-<name>; host interface names have no '-'.
+		hostIf, rest, ok := strings.Cut(e.Name(), "-")
+		if !ok {
+			continue
+		}
+		dir, name, ok := strings.Cut(rest, "-")
+		if !ok {
+			continue
+		}
+		hl := HookLink{HostIf: hostIf, Direction: dir, Name: name}
+		l, err := link.LoadPinnedLink(filepath.Join(d.hooksDir(containerID), e.Name()), nil)
+		if err != nil {
+			hl.Defunct = true
+		} else {
+			if info, err := l.Info(); err == nil {
+				hl.ProgramID = uint32(info.Program)
+				if nk := info.Netkit(); nk != nil && nk.Ifindex == 0 {
+					hl.Defunct = true
+				}
+			}
+			l.Close()
+		}
+		out = append(out, hl)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].HostIf < out[j].HostIf
+	})
+	return out, nil
+}
+
+// gcHooks removes the hook pins of containers keep reports as gone.
+func (d *Datapath) gcHooks(keep func(string) bool) int {
+	n := 0
+	cids, _ := os.ReadDir(filepath.Join(d.root, "hooks"))
+	for _, c := range cids {
+		if keep(c.Name()) {
+			continue
+		}
+		hls, _ := d.HookLinks(c.Name())
+		for _, hl := range hls {
+			d.DetachHooks(c.Name(), hl.HostIf)
+			n++
+		}
+		os.Remove(d.hooksDir(c.Name()))
+	}
+	return n
+}

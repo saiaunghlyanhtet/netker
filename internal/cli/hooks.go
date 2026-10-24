@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -20,7 +21,7 @@ ingress what's delivered to it. It runs before netker's program unless
 netker, return NETKIT_NEXT to continue or NETKIT_DROP; NETKIT_PASS would
 skip netker's anti-spoofing, isolation and NAT.`,
 	}
-	cmd.AddCommand(hookAddCmd())
+	cmd.AddCommand(hookAddCmd(), hookLsCmd(), hookRmCmd())
 	return cmd
 }
 
@@ -57,4 +58,78 @@ func hookAddCmd() *cobra.Command {
 	fl.StringVar(&o.Program, "program", "", "Program or section to use when the object has several")
 	fl.BoolVar(&o.After, "after", false, "Run after netker's program instead of before it")
 	return cmd
+}
+
+func hookLsCmd() *cobra.Command {
+	var format string
+	cmd := &cobra.Command{
+		Use:   "ls [CONTAINER...]",
+		Short: "List hooks, per interface, with their state in the kernel",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			m := manager()
+			defer m.Networks.Datapath().Close()
+			var cs []*container.Container
+			if len(args) == 0 {
+				all, err := m.List()
+				if err != nil {
+					return err
+				}
+				cs = all
+			}
+			for _, ref := range args {
+				c, err := m.Get(ref)
+				if err != nil {
+					return err
+				}
+				cs = append(cs, c)
+			}
+			var rows []container.HookState
+			for _, c := range cs {
+				hs, err := m.Hooks(c)
+				if err != nil {
+					return err
+				}
+				rows = append(rows, hs...)
+			}
+			if format == "json" {
+				return printJSON(cmd, rows)
+			}
+			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 3, ' ', 0)
+			fmt.Fprintln(tw, "CONTAINER\tHOOK\tDIRECTION\tPOSITION\tIFACE\tPROGRAM\tPROGRAM ID\tSTATE")
+			for _, r := range rows {
+				pos := "before netker"
+				if r.After {
+					pos = "after netker"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+					r.Container, r.Name, r.Direction, pos, r.IfName, r.Program, r.ProgramID, r.State)
+			}
+			return tw.Flush()
+		},
+	}
+	cmd.Flags().StringVar(&format, "format", "", "Output format: table or json")
+	return cmd
+}
+
+func hookRmCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "rm CONTAINER HOOK...",
+		Short: "Detach hooks from a container",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			m := manager()
+			defer m.Networks.Datapath().Close()
+			c, err := m.Get(args[0])
+			if err != nil {
+				return err
+			}
+			for _, name := range args[1:] {
+				if err := m.RemoveHook(c, name); err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), name)
+			}
+			return nil
+		},
+	}
 }

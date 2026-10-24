@@ -1464,3 +1464,62 @@ func TestEBPFHooks(t *testing.T) {
 		}
 	})
 }
+
+func TestEBPFHooksSurviveUpgrades(t *testing.T) {
+	s, bpffs := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	a, b := "a92a92a92a92a92a", "b92b92b92b92b92b"
+	epA, nsA := attachT(t, s, n, a)
+	epB, nsB := attachT(t, s, n, b)
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	h := datapath.Hook{Name: "deny", Direction: datapath.HookEgress, Spec: hookSpec(verdictDrop, false), Program: "hook"}
+	if err := s.AttachHook(a, epA, h); err != nil {
+		t.Fatal(err)
+	}
+	hookFirst := func(stage string) {
+		t.Helper()
+		order := programOrder(t, epA, ebpf.AttachNetkitPeer)
+		netker := netkerProgram(t, bpffs, a, epA, "peer")
+		if len(order) != 2 || order[1] != netker {
+			t.Fatalf("%s: program order %v, want [hook, netker %d]", stage, order, netker)
+		}
+		if _, err := dialIn(nsA, epB.IP.String()+":9000"); err == nil {
+			t.Fatalf("%s: the hook no longer drops", stage)
+		}
+	}
+	hookFirst("before upgrading")
+	oldNetker := netkerProgram(t, bpffs, a, epA, "peer")
+
+	dp2 := datapath.New(os.Getenv("NETKER_BPFFS"))
+	defer dp2.Close()
+	if _, err := dp2.Upgrade(); err != nil {
+		t.Fatal(err)
+	}
+	if netkerProgram(t, bpffs, a, epA, "peer") == oldNetker {
+		t.Fatal("upgrade didn't replace netker's program")
+	}
+	hookFirst("after datapath upgrade")
+
+	pinIncompatible(t, bpffs, "netker_nat", ebpf.LRUHash, 16)
+	s2 := NewStore(s.paths)
+	defer s2.dp.Close()
+	if _, err := s2.RebuildDatapath([]RestoreItem{
+		{ContainerID: a, NetNSPath: nsA, Endpoints: []*Endpoint{epA}},
+		{ContainerID: b, NetNSPath: nsB, Endpoints: []*Endpoint{epB}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hookFirst("after a map rebuild")
+
+	hls, err := s2.dp.HookLinks(a)
+	if err != nil || len(hls) != 1 || hls[0].Name != "deny" || hls[0].HostIf != epA.HostIf || hls[0].Defunct {
+		t.Fatalf("hook links %+v, %v", hls, err)
+	}
+	// gc with A's record gone removes its hooks (and links).
+	if _, _, err := s2.dp.GC(func(id string) bool { return id == b }); err != nil {
+		t.Fatal(err)
+	}
+	if hls, _ := s2.dp.HookLinks(a); len(hls) != 0 {
+		t.Fatalf("hooks left after gc: %+v", hls)
+	}
+}

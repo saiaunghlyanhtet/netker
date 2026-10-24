@@ -212,6 +212,7 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	if err := d.Load(); err != nil {
 		return 0, 0, err
 	}
+	links += d.gcHooks(keep)
 	cids, _ := os.ReadDir(d.linksDir())
 	for _, c := range cids {
 		if keep(c.Name()) {
