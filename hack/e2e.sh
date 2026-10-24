@@ -10,7 +10,7 @@ expect() { # expect <description> <want> <got>
 }
 cleanup() {
 	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web e2e-busy e2e-hooked e2e-hookweb >/dev/null 2>&1 || true
-	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
+	for n in e2e-two e2e-iso e2e-v6 e2e-l2 e2e-hooknet; do
 		netker network rm "$n" >/dev/null 2>&1 || true
 	done
 	ip link del e2e-pub0 2>/dev/null || true
@@ -185,7 +185,16 @@ if [[ "$datapath" == ebpf ]]; then
 	expect "hooks: net hook add prints the hook name" "block80" "$(netker net hook add --name block80 e2e-hookweb ingress "$hookobj")"
 	if curl -s --max-time 2 "http://$hw_ip/" >/dev/null; then fail "hooks: ingress hook on a running container didn't drop"; fi
 	echo "ok: hooks: net hook add on a running container drops TCP to port 80"
+	expect "hooks: ls shows the hook attached" "block80" "$(netker net hook ls e2e-hookweb | grep attached)"
+	netker network create --subnet 10.80.0.0/24 e2e-hooknet >/dev/null
+	netker network connect e2e-hooknet e2e-hookweb
+	expect "hooks: connect attaches the hooks to the new interface" "eth1" "$(netker net hook ls e2e-hookweb | grep attached)"
+	expect "hooks: rm prints the hook name" "block80" "$(netker net hook rm e2e-hookweb block80)"
+	expect "hooks: traffic flows again after rm" "hookweb" "$(curl -s --max-time 3 "http://$hw_ip/")"
+	[[ "$(netker net hook ls e2e-hookweb | wc -l)" == 1 ]] || fail "hooks: ls still lists hooks after rm"
+	echo "ok: hooks: rm leaves nothing behind"
 	netker rm -f e2e-hooked e2e-hookweb >/dev/null
+	netker network rm e2e-hooknet >/dev/null
 fi
 
 # network connect/disconnect on a running container (e2e-web: eth0 on

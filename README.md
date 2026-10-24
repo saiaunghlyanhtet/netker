@@ -53,6 +53,8 @@ sudo bin/netker stats                     # live per-container usage (--no-strea
 sudo bin/netker stats --net web           # per-interface counters, drops by reason
 sudo bin/netker net hook add web egress my_filter.o   # your own BPF program before netker's
 sudo bin/netker run --bpf-hook egress=my_filter.o alpine   # the same, at creation
+sudo bin/netker net hook ls               # hooks per interface, with their state
+sudo bin/netker net hook rm web my_filter
 ```
 
 A hook is a tc (`SCHED_CLS`) program on the container's netkit device, run
