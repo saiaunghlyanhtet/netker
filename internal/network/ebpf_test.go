@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/link"
 	"io"
 	"net"
 	"net/netip"
@@ -1273,4 +1275,192 @@ func TestEBPFTraceStopsWithoutTraffic(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Trace didn't return after cancel on a quiet datapath")
 	}
+}
+
+// hookSpec builds a hook program in Go: it adds 1 to counter[0] (when
+// counting) and returns verdict.
+func hookSpec(verdict int32, counting bool) *ebpf.CollectionSpec {
+	var insns asm.Instructions
+	spec := &ebpf.CollectionSpec{Maps: map[string]*ebpf.MapSpec{}, Programs: map[string]*ebpf.ProgramSpec{}}
+	if counting {
+		spec.Maps["counter"] = &ebpf.MapSpec{Name: "counter", Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: 1}
+		insns = append(insns,
+			asm.StoreImm(asm.R10, -4, 0, asm.Word),
+			asm.Mov.Reg(asm.R2, asm.R10),
+			asm.Add.Imm(asm.R2, -4),
+			asm.LoadMapPtr(asm.R1, 0).WithReference("counter"),
+			asm.FnMapLookupElem.Call(),
+			asm.JEq.Imm(asm.R0, 0, "out"),
+			asm.Mov.Imm(asm.R1, 1),
+			asm.StoreXAdd(asm.R0, asm.R1, asm.DWord),
+		)
+	}
+	insns = append(insns, asm.Mov.Imm(asm.R0, verdict).WithSymbol("out"), asm.Return())
+	spec.Programs["hook"] = &ebpf.ProgramSpec{Name: "hook", Type: ebpf.SchedCLS, License: "GPL", Instructions: insns}
+	return spec
+}
+
+const (
+	verdictNext = -1
+	verdictDrop = 2
+)
+
+// hookCounter reads counter[0] of the hook pinned for ep.
+func hookCounter(t *testing.T, bpffs, containerID string, ep *Endpoint, direction, name string) uint64 {
+	t.Helper()
+	l, err := link.LoadPinnedLink(filepath.Join(bpffs, "hooks", containerID, ep.HostIf+"-"+direction+"-"+name), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	info, err := l.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := ebpf.NewProgramFromID(info.Program)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	pi, _ := prog.Info()
+	ids, _ := pi.MapIDs()
+	if len(ids) != 1 {
+		t.Fatalf("hook program uses %d maps", len(ids))
+	}
+	m, err := ebpf.NewMapFromID(ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var v uint64
+	if err := m.Lookup(uint32(0), &v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// programOrder lists the programs on a device for one direction, in the
+// order netkit runs them.
+func programOrder(t *testing.T, ep *Endpoint, typ ebpf.AttachType) []ebpf.ProgramID {
+	t.Helper()
+	res, err := link.QueryPrograms(link.QueryOptions{Target: ep.HostIfIndex, Attach: typ})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []ebpf.ProgramID
+	for _, p := range res.Programs {
+		ids = append(ids, p.ID)
+	}
+	return ids
+}
+
+func netkerProgram(t *testing.T, bpffs, containerID string, ep *Endpoint, side string) ebpf.ProgramID {
+	t.Helper()
+	l, err := link.LoadPinnedLink(filepath.Join(bpffs, "links", containerID, ep.HostIf+"-"+side), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	info, _ := l.Info()
+	return info.Program
+}
+
+func TestEBPFHooks(t *testing.T) {
+	s, bpffs := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	a, b := "a91a91a91a91a91a", "b91b91b91b91b91b"
+	epA, nsA := attachT(t, s, n, a)
+	epB, nsB := attachT(t, s, n, b)
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	listenIn(t, "", epA.Gateway.String()+":8089")
+	toB := func() error { _, err := dialIn(nsA, epB.IP.String()+":9000"); return err }
+	toHost := func() error { _, err := dialIn(nsA, epA.Gateway.String()+":8089"); return err }
+
+	t.Run("before netker, dropping", func(t *testing.T) {
+		h := datapath.Hook{Name: "deny", Direction: datapath.HookEgress, Spec: hookSpec(verdictDrop, false), Program: "hook"}
+		if err := s.AttachHook(a, epA, h); err != nil {
+			t.Fatal(err)
+		}
+		order := programOrder(t, epA, ebpf.AttachNetkitPeer)
+		if len(order) != 2 || order[1] != netkerProgram(t, bpffs, a, epA, "peer") {
+			t.Fatalf("program order %v: the hook isn't before netker's", order)
+		}
+		if toB() == nil || toHost() == nil {
+			t.Fatal("traffic got past a dropping hook")
+		}
+		if err := s.DetachHook(a, epA, datapath.HookEgress, "deny"); err != nil {
+			t.Fatal(err)
+		}
+		if err := toB(); err != nil {
+			t.Fatalf("after removing the hook: %v", err)
+		}
+	})
+	t.Run("before netker, counting and continuing", func(t *testing.T) {
+		h := datapath.Hook{Name: "count", Direction: datapath.HookEgress, Spec: hookSpec(verdictNext, true), Program: "hook"}
+		if err := s.AttachHook(a, epA, h); err != nil {
+			t.Fatal(err)
+		}
+		defer s.DetachHook(a, epA, datapath.HookEgress, "count")
+		fwd := metric(t, s, epA.HostIfIndex, "forward-local")
+		if err := toB(); err != nil {
+			t.Fatalf("A->B through a continuing hook: %v", err)
+		}
+		if hookCounter(t, bpffs, a, epA, datapath.HookEgress, "count") == 0 {
+			t.Fatal("the hook didn't see A's packets")
+		}
+		if metric(t, s, epA.HostIfIndex, "forward-local") == fwd {
+			t.Fatal("netker's program didn't run after the hook")
+		}
+	})
+	t.Run("after netker sees what netker passes, not what it redirects", func(t *testing.T) {
+		h := datapath.Hook{Name: "late", Direction: datapath.HookEgress, After: true, Spec: hookSpec(verdictDrop, false), Program: "hook"}
+		if err := s.AttachHook(a, epA, h); err != nil {
+			t.Fatal(err)
+		}
+		defer s.DetachHook(a, epA, datapath.HookEgress, "late")
+		order := programOrder(t, epA, ebpf.AttachNetkitPeer)
+		if len(order) != 2 || order[0] != netkerProgram(t, bpffs, a, epA, "peer") {
+			t.Fatalf("program order %v: the hook isn't after netker's", order)
+		}
+		if err := toB(); err != nil {
+			t.Fatalf("redirected traffic reached an after-hook: %v", err)
+		}
+		if toHost() == nil {
+			t.Fatal("traffic netker passes to the host skipped the after-hook")
+		}
+	})
+	t.Run("ingress", func(t *testing.T) {
+		h := datapath.Hook{Name: "in", Direction: datapath.HookIngress, Spec: hookSpec(verdictDrop, false), Program: "hook"}
+		if err := s.AttachHook(b, epB, h); err != nil {
+			t.Fatal(err)
+		}
+		if toB() == nil {
+			t.Fatal("traffic into B got past its ingress hook")
+		}
+		s.DetachHook(b, epB, datapath.HookIngress, "in")
+		if err := toB(); err != nil {
+			t.Fatalf("after removing the ingress hook: %v", err)
+		}
+	})
+	t.Run("duplicate name and bad direction", func(t *testing.T) {
+		h := datapath.Hook{Name: "x", Direction: datapath.HookEgress, Spec: hookSpec(verdictNext, false), Program: "hook"}
+		if err := s.AttachHook(a, epA, h); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AttachHook(a, epA, h); err == nil {
+			t.Fatal("same hook name attached twice")
+		}
+		h.Name, h.Direction = "y", "sideways"
+		if err := s.AttachHook(a, epA, h); err == nil {
+			t.Fatal("bad direction accepted")
+		}
+	})
+	t.Run("detaching the endpoint removes its hooks", func(t *testing.T) {
+		if err := s.Detach(epA, a); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(bpffs, "hooks", a)); !os.IsNotExist(err) {
+			t.Fatalf("hook pins left after detach: %v", err)
+		}
+	})
 }

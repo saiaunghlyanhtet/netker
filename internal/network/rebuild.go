@@ -68,3 +68,17 @@ func (s *Store) RebuildDatapath(items []RestoreItem) (*RebuildReport, error) {
 	report.Links, err = s.dp.FinishRebuild()
 	return report, err
 }
+
+// AttachHook attaches a user BPF program to ep's netkit device, next to
+// netker's own program. Only eBPF endpoints have one to attach to.
+func (s *Store) AttachHook(containerID string, ep *Endpoint, h datapath.Hook) error {
+	if ep.Datapath != DatapathEBPF {
+		return fmt.Errorf("%s uses the %s datapath: hooks need the eBPF datapath", ep.IfName, ep.Datapath)
+	}
+	return s.dp.AttachHook(containerID, ep.HostIf, ep.HostIfIndex, h)
+}
+
+// DetachHook removes a user BPF program from ep's netkit device.
+func (s *Store) DetachHook(containerID string, ep *Endpoint, direction, name string) error {
+	return s.dp.DetachHook(containerID, ep.HostIf, direction, name)
+}

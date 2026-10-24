@@ -52,7 +52,7 @@ static __attribute__((noinline)) int to_local(struct __sk_buff *skb, __u32 self,
 	__builtin_memcpy(macs + 6, dst->mac, 6);
 	if ((v6 ? dec_hoplimit(skb) : dec_ttl(skb)) < 0) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 	if (bpf_skb_store_bytes(skb, 0, macs, sizeof(macs), 0) < 0) {
 		count(skb, self, DIR_EGRESS, REASON_DROP_MALFORMED);
@@ -107,7 +107,7 @@ static __always_inline int from_container_arp(struct __sk_buff *skb, struct ethh
 		return NETKIT_DROP;
 	}
 	count(skb, self, DIR_EGRESS, REASON_PASS_ARP);
-	return NETKIT_PASS;
+	return NK_PASS;
 }
 
 static __always_inline bool ip6_is_mcast(const struct in6_addr *a)
@@ -193,7 +193,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 	struct bpf_fib_lookup *fib = scratch_fib();
 	if (!fib) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 	fib->family = AF_INET6;
 	fib->ifindex = self;
@@ -220,7 +220,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 			pv = lookup_port6(daddr, l.dport, l.proto, true);
 		if (!pv) {
 			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-			return NETKIT_PASS;
+			return NK_PASS;
 		}
 		__u8 ctr[16];
 		__be16 ctr_port = pv->ctr_port;
@@ -245,7 +245,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 	}
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 
 	/* Out through an uplink. */
@@ -262,7 +262,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 			 * host stack and nftables masquerade handle it.
 			 */
 			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-			return NETKIT_PASS;
+			return NK_PASS;
 		}
 		struct nat6_val *nv = snat6_lookup_or_alloc(&l, saddr, daddr, nat_addr, self);
 		if (!nv) {
@@ -278,7 +278,7 @@ static __attribute__((noinline)) int from_container6(struct __sk_buff *skb, __u3
 	}
 	if (dec_hoplimit(skb) < 0) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 	count(skb, self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT);
 	return bpf_redirect_neigh(out_ifindex, NULL, 0, 0);
@@ -304,7 +304,7 @@ static __always_inline int to_container6(struct __sk_buff *skb, struct ethhdr *e
 		return NETKIT_DROP;
 	}
 	count(skb, dst->ifindex, DIR_INGRESS, REASON_DELIVER);
-	return NETKIT_PASS;
+	return NK_PASS;
 }
 
 /* from_container4 is nk_from_container's IPv4 path. Like from_container6
@@ -393,7 +393,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 	struct bpf_fib_lookup *fib = scratch_fib();
 	if (!fib) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 	fib->family = AF_INET;
 	fib->ifindex = self;
@@ -424,7 +424,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 			pv = lookup_port(daddr, l.dport, l.proto, true);
 		if (!pv) {
 			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-			return NETKIT_PASS;
+			return NK_PASS;
 		}
 		__be32 ctr_addr = pv->ctr_addr;
 		__be16 ctr_port = pv->ctr_port;
@@ -449,7 +449,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 	if (rc != BPF_FIB_LKUP_RET_SUCCESS && rc != BPF_FIB_LKUP_RET_NO_NEIGH) {
 		/* Unreachable, prohibited, ...: the stack answers with ICMP. */
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 
 	/* Out through an uplink. */
@@ -464,7 +464,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 			 * the uplink: the stack and nftables masquerade handle it.
 			 */
 			count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-			return NETKIT_PASS;
+			return NK_PASS;
 		}
 		struct nat_val *nv = snat_lookup_or_alloc(&l, saddr, daddr, fib->ipv4_src, self);
 		if (!nv) {
@@ -481,7 +481,7 @@ static __attribute__((noinline)) int from_container4(struct __sk_buff *skb, __u3
 	}
 	if (dec_ttl(skb) < 0) {
 		count(skb, self, DIR_EGRESS, REASON_PASS_STACK);
-		return NETKIT_PASS;
+		return NK_PASS;
 	}
 	count(skb, self, DIR_EGRESS, rev_dnat ? REASON_REV_DNAT : REASON_SNAT);
 	/* The neighbour subsystem resolves the next hop and fills in the MACs. */
@@ -524,7 +524,7 @@ int nk_to_container(struct __sk_buff *skb)
 	if ((void *)(eth + 1) > data_end)
 		return NETKIT_DROP;
 	if (eth->h_proto == bpf_htons(ETH_P_ARP))
-		return NETKIT_PASS;
+		return NK_PASS;
 	if (eth->h_proto == bpf_htons(ETH_P_IPV6))
 		return to_container6(skb, eth, self_peer);
 	if (eth->h_proto != bpf_htons(ETH_P_IP))
@@ -544,7 +544,7 @@ int nk_to_container(struct __sk_buff *skb)
 		return NETKIT_DROP;
 	}
 	count(skb, dst->ifindex, DIR_INGRESS, REASON_DELIVER);
-	return NETKIT_PASS;
+	return NK_PASS;
 }
 
 static __always_inline bool is_loopback(__be32 addr)

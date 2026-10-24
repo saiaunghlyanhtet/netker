@@ -51,6 +51,18 @@ sudo bin/netker net trace --drops         # every packet the datapath drops, and
 sudo bin/netker net trace web             # every verdict for one container (forward, NAT, deliver, drop)
 sudo bin/netker stats                     # live per-container usage (--no-stream for one sample)
 sudo bin/netker stats --net web           # per-interface counters, drops by reason
+sudo bin/netker net hook add web egress my_filter.o   # your own BPF program before netker's
+sudo bin/netker run --bpf-hook egress=my_filter.o alpine   # the same, at creation
+```
+
+A hook is a tc (`SCHED_CLS`) program on the container's netkit device, run
+before netker's program (or after it, with `--after`). Before netker, return
+`NETKIT_NEXT` to continue or `NETKIT_DROP`; see
+[bpf/include/netker_hook.h](bpf/include/netker_hook.h) and the example in
+[examples/hooks/](examples/hooks/drop_tcp_port.c). Hooks are root-only and
+trusted: one that returns `NETKIT_PASS` skips netker's checks.
+
+```sh
 sudo bin/netker system datapath upgrade   # swap every container's programs atomically
                                           # (run after upgrading netker; see below)
 sudo bin/netker system datapath sync      # attach to uplinks that appeared since

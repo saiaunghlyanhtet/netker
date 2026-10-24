@@ -182,6 +182,10 @@ func (d *Datapath) Detach(containerID, hostIf string, ip, ip6 netip.Addr) error 
 			errs = append(errs, err)
 		}
 	}
+	// Hooks first: they're anchored to netker's links.
+	if err := d.DetachHooks(containerID, hostIf); err != nil {
+		errs = append(errs, err)
+	}
 	for _, side := range []string{"peer", "primary"} {
 		p := d.linkPin(containerID, hostIf, side)
 		l, err := link.LoadPinnedLink(p, nil)

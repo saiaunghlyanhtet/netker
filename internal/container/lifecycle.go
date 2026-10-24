@@ -36,6 +36,7 @@ type CreateOptions struct {
 	IP         netip.Addr // on the first network
 	Ports      []network.PortMapping
 	AutoRemove bool
+	Hooks      []HookOptions
 	Pull       io.Writer // progress output if the image has to be pulled
 }
 
@@ -118,6 +119,11 @@ func (m *Manager) Create(o CreateOptions) (c *Container, err error) {
 	}
 	if err := m.setupNetwork(c, o.IP); err != nil {
 		return c, err
+	}
+	for _, h := range o.Hooks {
+		if err := m.addHook(c, h); err != nil {
+			return c, err
+		}
 	}
 	if err := m.writeEtcFiles(c); err != nil {
 		return c, err

@@ -22,7 +22,7 @@ func netCmd() *cobra.Command {
 		Use:   "net",
 		Short: "Observe the eBPF datapath",
 	}
-	cmd.AddCommand(traceCmd())
+	cmd.AddCommand(traceCmd(), hookCmd())
 	return cmd
 }
 

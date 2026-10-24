@@ -40,6 +40,10 @@ func (m *Manager) Connect(c *Container, name string, ip netip.Addr) error {
 	}
 	c.Endpoints = append(c.Endpoints, ep)
 	c.Networks = append(c.Networks, name)
+	if err := m.applyHooks(c, ep); err != nil {
+		m.Networks.Detach(ep, c.ID)
+		return err
+	}
 	c.Network = c.Networks[0]
 	if err := m.save(c); err != nil {
 		return err

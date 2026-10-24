@@ -9,7 +9,7 @@ expect() { # expect <description> <want> <got>
 	echo "ok: $1"
 }
 cleanup() {
-	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web e2e-busy >/dev/null 2>&1 || true
+	netker rm -f e2e-web e2e-solo e2e-none e2e-peer e2e-iso1 e2e-iso2 e2e-v6a e2e-v6web e2e-busy e2e-hooked e2e-hookweb >/dev/null 2>&1 || true
 	for n in e2e-two e2e-iso e2e-v6 e2e-l2; do
 		netker network rm "$n" >/dev/null 2>&1 || true
 	done
@@ -168,6 +168,26 @@ expect "two networks: default route on eth0" "default via 10.87.0.1 dev eth0" "$
 expect "two networks: reaches a container on the second network" "solo" "$out"
 if netker run --rm --network host --network e2e-two alpine true 2>/dev/null; then fail "--network host combined with another network was accepted"; fi
 echo "ok: --network host can't be combined with other networks"
+if [[ "$datapath" == ebpf ]]; then
+	# User BPF hooks, with the example that drops TCP to port 80.
+	hookobj="$(cd "$(dirname "$0")/.." && pwd)/internal/datapath/testdata/drop_tcp_port.o"
+	netker run -d --name e2e-hooked --bpf-hook "egress=$hookobj" alpine sleep 300 >/dev/null
+	if netker exec e2e-hooked wget -T 2 -qO- "http://$ip/" >/dev/null 2>&1; then
+		fail "hooks: --bpf-hook didn't drop TCP to port 80"
+	fi
+	echo "ok: hooks: --bpf-hook egress hook drops TCP to port 80"
+	expect "hooks: other traffic continues to netker's program" "1 packets received" "$(netker exec e2e-hooked ping -c1 -W2 "$ip")"
+	netker run -d --name e2e-hookweb alpine sh -c \
+		'while true; do printf "HTTP/1.0 200 OK\r\n\r\nhookweb\n" | nc -l -p 80; done' >/dev/null
+	sleep 0.5
+	hw_ip=$(netker inspect e2e-hookweb | sed -n 's/.*"ip": "\(.*\)".*/\1/p' | head -1)
+	expect "hooks: server reachable before the hook" "hookweb" "$(curl -s --max-time 3 "http://$hw_ip/")"
+	expect "hooks: net hook add prints the hook name" "block80" "$(netker net hook add --name block80 e2e-hookweb ingress "$hookobj")"
+	if curl -s --max-time 2 "http://$hw_ip/" >/dev/null; then fail "hooks: ingress hook on a running container didn't drop"; fi
+	echo "ok: hooks: net hook add on a running container drops TCP to port 80"
+	netker rm -f e2e-hooked e2e-hookweb >/dev/null
+fi
+
 # network connect/disconnect on a running container (e2e-web: eth0 on
 # "netker", default route, published port 8080).
 netker network connect e2e-two e2e-web
