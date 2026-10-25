@@ -1,0 +1,30 @@
+name: checkpatch
+
+# The kernel's checkpatch.pl on the BPF code of each commit in the PR, as
+# Cilium runs it (make -C bpf checkpatch, from its lint-bpf-checks
+# workflow). It runs on every PR, not only those touching bpf/: it also
+# wants a Signed-off-by on every commit and subjects of at most 75
+# characters.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checkpatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: checkpatch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          make -C bpf checkpatch || (echo "Run 'make -C bpf checkpatch' locally to see the reports"; exit 1)
