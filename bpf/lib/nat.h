@@ -32,19 +32,21 @@ static __always_inline void snat_keys(struct nat_key *out, struct nat_key *in,
 /* Not inlined: its keys and values would otherwise sit in the caller's
  * frame, and the verifier limits the whole call chain to 512 bytes.
  */
-static __attribute__((noinline)) struct nat_val *
+static __noinline struct nat_val *
 snat_lookup_or_alloc(const struct l4 *l, __be32 ctr_addr, __be32 remote, __be32 nat_addr,
 		     __u32 ctr_ifindex)
 {
 	struct nat_key out, in;
 	struct nat_val *v;
 
-	snat_keys(&out, &in, ctr_addr, l->sport, remote, l->dport, nat_addr, 0, l->proto, l->is_echo);
+	snat_keys(&out, &in, ctr_addr, l->sport, remote, l->dport, nat_addr, 0,
+		  l->proto, l->is_echo);
 	v = bpf_map_lookup_elem(&netker_nat, &out);
 	if (v && v->addr == nat_addr)
 		return v;
 
 	struct config *cfg = get_config();
+
 	if (!cfg || cfg->nat_port_max <= cfg->nat_port_min)
 		return NULL;
 	__u32 span = (__u32)cfg->nat_port_max - cfg->nat_port_min + 1;
@@ -62,6 +64,7 @@ snat_lookup_or_alloc(const struct l4 *l, __be32 ctr_addr, __be32 remote, __be32 
 		if (bpf_map_update_elem(&netker_nat, &in, &rev, BPF_NOEXIST) != 0)
 			continue;
 		struct nat_val fwd = { .addr = nat_addr, .port = nport };
+
 		if (bpf_map_update_elem(&netker_nat, &out, &fwd, BPF_ANY) != 0) {
 			bpf_map_delete_elem(&netker_nat, &in);
 			return NULL;

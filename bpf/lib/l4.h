@@ -26,6 +26,7 @@ static __always_inline bool parse_l4(struct __sk_buff *skb, struct iphdr *ip, st
 	if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET))
 		return false;
 	__u32 ihl = ip->ihl & 0xF;
+
 	if (ihl < 5)
 		return false;
 	l->off = ETH_HLEN + ihl * 4;
@@ -36,6 +37,7 @@ static __always_inline bool parse_l4(struct __sk_buff *skb, struct iphdr *ip, st
 	case IPPROTO_TCP:
 	case IPPROTO_UDP: {
 		__be16 ports[2];
+
 		if (bpf_skb_load_bytes(skb, l->off, ports, sizeof(ports)) < 0)
 			return false;
 		l->sport = ports[0];
@@ -47,6 +49,7 @@ static __always_inline bool parse_l4(struct __sk_buff *skb, struct iphdr *ip, st
 	}
 	case IPPROTO_ICMP: {
 		struct icmp_echo ic;
+
 		if (bpf_skb_load_bytes(skb, l->off, &ic, sizeof(ic)) < 0)
 			return false;
 		if (ic.type != ICMP_ECHO && ic.type != ICMP_ECHOREPLY)
