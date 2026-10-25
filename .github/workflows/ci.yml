@@ -22,6 +22,11 @@ jobs:
       - name: Unit tests
         run: go test ./...
 
+      # The BPF objects are committed; rebuild them in the pinned clang
+      # container and fail if they differ from what's in the tree.
+      - name: Generated BPF objects are up to date
+        run: make check-generate
+
       - name: Install crun and nftables
         run: sudo apt-get update && sudo apt-get install -y crun nftables
 

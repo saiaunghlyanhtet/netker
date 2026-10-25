@@ -91,7 +91,8 @@ make test-integration   # real netkit devices in an unprivileged netns (legacy d
 make e2e                # full CLI test in the sandbox (legacy datapath)
 make test-ebpf          # network tests as root in a privileged Docker container (eBPF)
 make e2e-root           # full CLI test as root in a privileged Docker container (eBPF)
-go generate ./internal/datapath/   # rebuild bpf/netker.c (needs clang)
+make generate           # rebuild the committed BPF objects after changing bpf/ (in a pinned clang container)
+make check-generate     # fail if the committed objects are stale (run by CI)
 ```
 
 ## Upgrading netker
