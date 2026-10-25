@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/saiaunghlyanhtet/netker/internal/cli.Version=$(VERSION)
 
-.PHONY: build test test-integration test-ebpf e2e e2e-root e2e-ubuntu check fmt vet
+.PHONY: build test test-integration test-ebpf e2e e2e-root e2e-ubuntu check fmt vet generate check-generate
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/netker ./cmd/netker
@@ -26,6 +26,23 @@ fmt:
 
 vet:
 	go vet ./...
+
+# The BPF objects are committed (go:embed needs them, and "go install" never
+# runs go generate), so they're built in a pinned container: the same clang
+# and libbpf headers everywhere, and byte-identical output. The image digest
+# pins Go and Debian trixie, whose clang-19, llvm-19 and libbpf-dev it installs.
+BPF_BUILDER = golang:1.26.4-trixie@sha256:68b7145ec43d1820b9a56704554b53d1520aa2a15cb5233e374188a31b2a1bce
+
+generate:
+	docker run --rm -v $(CURDIR):/src -v netker-gomod:/go/pkg/mod -w /src -e GOFLAGS=-buildvcs=false -e DEBIAN_FRONTEND=noninteractive $(BPF_BUILDER) sh -c \
+		'apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends clang-19 llvm-19 libbpf-dev >/dev/null && \
+		 ln -s /usr/bin/clang-19 /usr/local/bin/clang && ln -s /usr/bin/llvm-strip-19 /usr/local/bin/llvm-strip && \
+		 ln -s /usr/include/$$(uname -m)-linux-gnu/asm /usr/include/asm && go generate ./internal/datapath/ && \
+		 chown $(shell id -u):$(shell id -g) internal/datapath/netker_bpf_bpfel.* internal/datapath/testdata/drop_tcp_port.o'
+
+# Fails if the committed BPF objects don't match bpf/ and examples/hooks/.
+check-generate: generate
+	git diff --exit-code -- internal/datapath/
 
 # eBPF datapath tests need real root. They run in a throwaway privileged
 # container, which has its own network namespace and bpffs mount.
