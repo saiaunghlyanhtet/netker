@@ -244,6 +244,7 @@ static __always_inline void add_metric(__u32 ifindex, __u8 dir, __u8 reason, __u
 		return;
 	}
 	struct metrics_val init = { .packets = 1, .bytes = len };
+
 	bpf_map_update_elem(&netker_metrics, &key, &init, BPF_NOEXIST);
 }
 
@@ -252,11 +253,12 @@ static __always_inline void add_metric(__u32 ifindex, __u8 dir, __u8 reason, __u
  * own rather than inlined: it's called from dozens of places, and inlined
  * copies of the event header pushed the IPv6 path over the 512-byte stack.
  */
-static __attribute__((noinline)) void count(struct __sk_buff *skb, __u32 ifindex, __u8 dir, __u8 reason)
+static __noinline void count(struct __sk_buff *skb, __u32 ifindex, __u8 dir, __u8 reason)
 {
 	add_metric(ifindex, dir, reason, skb->len);
 
 	bool drop = is_drop(reason);
+
 	if (!drop && !tracing(ifindex))
 		return;
 	struct event_hdr ev = {
@@ -269,6 +271,7 @@ static __attribute__((noinline)) void count(struct __sk_buff *skb, __u32 ifindex
 		.ts = bpf_ktime_get_ns(),
 	};
 	__u64 flags = ((__u64)ev.cap_len << 32) | BPF_F_CURRENT_CPU;
+
 	bpf_perf_event_output(skb, &netker_events, flags, &ev, sizeof(ev));
 }
 
@@ -281,10 +284,12 @@ static __always_inline void count_sock(__u32 ifindex, __u8 dir, __u8 reason)
 static __always_inline struct config *get_config(void)
 {
 	__u32 zero = 0;
+
 	return bpf_map_lookup_elem(&netker_config, &zero);
 }
 
-static __always_inline struct port_val *lookup_port(__be32 addr, __be16 port, __u8 proto, bool addr_is_local)
+static __always_inline struct port_val *
+lookup_port(__be32 addr, __be16 port, __u8 proto, bool addr_is_local)
 {
 	struct port_key key = { .addr = addr, .port = port, .proto = proto };
 	struct port_val *v = bpf_map_lookup_elem(&netker_ports, &key);
@@ -344,7 +349,8 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } netker_ports6 SEC(".maps");
 
-static __always_inline struct port6_val *lookup_port6(const __u8 *addr, __be16 port, __u8 proto, bool addr_is_local)
+static __always_inline struct port6_val *
+lookup_port6(const __u8 *addr, __be16 port, __u8 proto, bool addr_is_local)
 {
 	struct port6_key key = { .port = port, .proto = proto };
 	struct port6_val *v;

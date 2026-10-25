@@ -44,6 +44,7 @@ static __always_inline bool parse_l4_6(struct __sk_buff *skb, struct ipv6hdr *ip
 	case IPPROTO_TCP:
 	case IPPROTO_UDP: {
 		__be16 ports[2];
+
 		if (bpf_skb_load_bytes(skb, l->off, ports, sizeof(ports)) < 0)
 			return false;
 		l->sport = ports[0];
@@ -55,6 +56,7 @@ static __always_inline bool parse_l4_6(struct __sk_buff *skb, struct ipv6hdr *ip
 	}
 	case IPPROTO_ICMPV6: {
 		struct icmp_echo ic;
+
 		if (bpf_skb_load_bytes(skb, l->off, &ic, sizeof(ic)) < 0)
 			return false;
 		if (ic.type != ICMPV6_ECHO_REQUEST && ic.type != ICMPV6_ECHO_REPLY)
@@ -81,6 +83,7 @@ static __always_inline int rewrite_addr6(struct __sk_buff *skb, const struct l4 
 	__builtin_memcpy(o, old, 16);
 	__builtin_memcpy(n, new, 16);
 	__s64 diff = bpf_csum_diff(o, sizeof(o), n, sizeof(n), 0);
+
 	if (diff < 0)
 		return -1;
 	if (bpf_l4_csum_replace(skb, l->csum_off, 0, diff, BPF_F_PSEUDO_HDR | l4_csum_flags(l)) < 0)
@@ -89,11 +92,13 @@ static __always_inline int rewrite_addr6(struct __sk_buff *skb, const struct l4 
 }
 
 /* snat6_lookup_or_alloc is snat_lookup_or_alloc for IPv6. */
-static __attribute__((noinline)) struct nat6_val *
+static __noinline struct nat6_val *
 snat6_lookup_or_alloc(const struct l4 *l, const __u8 *ctr, const __u8 *remote, const __u8 *nat_addr,
 		      __u32 ctr_ifindex)
 {
-	struct nat6_key out = { .sport = l->sport, .dport = l->dport, .proto = l->proto, .dir = NAT_SNAT_OUT };
+	struct nat6_key out = {
+		.sport = l->sport, .dport = l->dport, .proto = l->proto, .dir = NAT_SNAT_OUT,
+	};
 	struct nat6_key in = { .proto = l->proto, .dir = NAT_SNAT_IN };
 	struct nat6_val *v;
 
@@ -104,10 +109,12 @@ snat6_lookup_or_alloc(const struct l4 *l, const __u8 *ctr, const __u8 *remote, c
 		return v;
 
 	struct config *cfg = get_config();
+
 	if (!cfg || cfg->nat_port_max <= cfg->nat_port_min)
 		return NULL;
 	__u32 span = (__u32)cfg->nat_port_max - cfg->nat_port_min + 1;
 	struct nat6_val rev = { .port = l->sport, .ifindex = ctr_ifindex };
+
 	__builtin_memcpy(rev.addr, ctr, 16);
 	__builtin_memcpy(in.saddr, remote, 16);
 	__builtin_memcpy(in.daddr, nat_addr, 16);
@@ -120,6 +127,7 @@ snat6_lookup_or_alloc(const struct l4 *l, const __u8 *ctr, const __u8 *remote, c
 		if (bpf_map_update_elem(&netker_nat6, &in, &rev, BPF_NOEXIST) != 0)
 			continue;
 		struct nat6_val fwd = { .port = nport };
+
 		__builtin_memcpy(fwd.addr, nat_addr, 16);
 		if (bpf_map_update_elem(&netker_nat6, &out, &fwd, BPF_ANY) != 0) {
 			bpf_map_delete_elem(&netker_nat6, &in);

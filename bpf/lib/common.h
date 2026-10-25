@@ -40,6 +40,7 @@ struct icmp_echo {
 	__be16 id;
 	__be16 seq;
 };
+
 #define ICMP_ECHOREPLY 0
 #define ICMP_ECHO 8
 
