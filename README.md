@@ -93,6 +93,7 @@ make test-ebpf          # network tests as root in a privileged Docker container
 make e2e-root           # full CLI test as root in a privileged Docker container (eBPF)
 make generate           # rebuild the committed BPF objects after changing bpf/ (in a pinned clang container)
 make check-generate     # fail if the committed objects are stale (run by CI)
+make -C bpf checkpatch  # kernel checkpatch.pl on bpf/, per commit (CHECKPATCH_OPTS=-a: all files)
 ```
 
 ## Upgrading netker
