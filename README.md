@@ -87,6 +87,7 @@ make e2e                 # the end-to-end test suite, unprivileged
 
 ```sh
 make test               # unit tests
+make lint               # golangci-lint, go mod tidy, shellcheck (as CI)
 make test-integration   # real netkit devices in an unprivileged netns (legacy datapath)
 make e2e                # full CLI test in the sandbox (legacy datapath)
 make test-ebpf          # network tests as root in a privileged Docker container (eBPF)

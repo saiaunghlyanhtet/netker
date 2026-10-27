@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  # The defaults (govet, staticcheck, ineffassign, unused) plus misspell.
+  # errcheck stays off for now: netker ignores errors on purpose in many
+  # best-effort cleanup paths, which need annotating (_ =) first.
+  default: standard
+  disable:
+    - errcheck
+  enable:
+    - misspell
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+
+formatters:
+  enable:
+    - gofmt

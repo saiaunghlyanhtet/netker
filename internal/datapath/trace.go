@@ -123,9 +123,10 @@ func (d *Datapath) Trace(ctx context.Context, opts TraceOptions, fn func(Event) 
 		if !ok {
 			continue
 		}
-		// Drops aren't filtered in BPF.
-		if len(watch) > 0 && !watch[ev.Ifindex] &&
-			!(ev.Drop && (addrs[ev.Src.Addr()] || addrs[ev.Dst.Addr()])) {
+		// Drops aren't filtered in BPF, and a drop may be reported before
+		// its device is known: match those by address too.
+		dropOfWatched := ev.Drop && (addrs[ev.Src.Addr()] || addrs[ev.Dst.Addr()])
+		if len(watch) > 0 && !watch[ev.Ifindex] && !dropOfWatched {
 			continue
 		}
 		if !fn(ev) {

@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/saiaunghlyanhtet/netker/internal/cli.Version=$(VERSION)
 
-.PHONY: build test test-integration test-ebpf e2e e2e-root e2e-ubuntu check fmt vet generate check-generate
+.PHONY: build test test-integration test-ebpf e2e e2e-root e2e-ubuntu check fmt vet generate check-generate lint
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/netker ./cmd/netker
@@ -26,6 +26,15 @@ fmt:
 
 vet:
 	go vet ./...
+
+# What the lint workflow runs: golangci-lint (v2, see .golangci.yml; it must
+# be built with the go.mod Go version), go.mod tidiness and shellcheck.
+SHELLCHECK_IMAGE = koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+
+lint:
+	golangci-lint run ./...
+	go mod tidy -diff
+	docker run --rm -v $(CURDIR):/mnt -w /mnt $(SHELLCHECK_IMAGE) hack/*.sh
 
 # The BPF objects are committed (go:embed needs them, and "go install" never
 # runs go generate), so they're built in a pinned container: the same clang
