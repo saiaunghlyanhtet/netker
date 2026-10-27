@@ -150,7 +150,7 @@ func (s *Store) Attach(n *Network, containerID, nsPath string, idx int, want net
 			return nil, err
 		}
 	}
-	if err := ensureNetworkRules(n); err != nil {
+	if err := s.ensureRules(n, mode); err != nil {
 		return nil, err
 	}
 	return ep, nil

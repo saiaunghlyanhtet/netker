@@ -27,8 +27,15 @@ func requireNetAdmin(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs CAP_NET_ADMIN; run under `unshare -rnm`")
 	}
-	if _, err := exec.LookPath("nft"); err != nil {
-		t.Skip("nft not installed")
+}
+
+// requireLegacy is requireNetAdmin for tests on the legacy datapath, which
+// needs nftables.
+func requireLegacy(t *testing.T) {
+	t.Helper()
+	requireNetAdmin(t)
+	if err := NftablesUsable("ip"); err != nil {
+		t.Skipf("the legacy datapath needs nftables: %v", err)
 	}
 }
 
@@ -102,7 +109,7 @@ func dialIn(nsPath, addr string) (string, error) {
 }
 
 func TestAttachL3(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n, err := s.Get(DefaultName)
 	if err != nil {
@@ -164,7 +171,7 @@ func TestAttachL3(t *testing.T) {
 }
 
 func TestContainerToContainer(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n, err := s.Get(DefaultName)
 	if err != nil {
@@ -189,7 +196,7 @@ func TestContainerToContainer(t *testing.T) {
 }
 
 func TestAttachL2(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n := &Network{Name: "l2net", Subnet: netip.MustParsePrefix("10.99.0.0/24"), Mode: netkit.ModeL2}
 	if err := s.Create(n); err != nil {
@@ -216,7 +223,7 @@ func TestAttachL2(t *testing.T) {
 }
 
 func TestPublishPorts(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n, _ := s.Get(DefaultName)
 	id := "dddddddddddddddd"
@@ -252,7 +259,7 @@ func TestPublishPorts(t *testing.T) {
 }
 
 func TestMultipleNetworks(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n1, err := s.Get(DefaultName)
 	if err != nil {
@@ -318,7 +325,7 @@ func TestMultipleNetworks(t *testing.T) {
 // attach to a namespace that already has an interface, detach the one with
 // the default route, and move the default route to what's left.
 func TestHotplugAndDefaultRouteMove(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n1, _ := s.Get(DefaultName)
 	n2 := &Network{Name: "hot", Subnet: netip.MustParsePrefix("10.93.0.0/24")}
@@ -390,7 +397,7 @@ func TestHotplugAndDefaultRouteMove(t *testing.T) {
 // TestNoICC runs on whichever datapath is available: nftables when
 // unprivileged, BPF as root.
 func TestNoICC(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n := &Network{Name: "noicc", Subnet: netip.MustParsePrefix("10.92.0.0/24"), NoICC: true}
 	if err := s.Create(n); err != nil {
@@ -456,7 +463,7 @@ func readSysctl(t *testing.T, key string) string {
 }
 
 func TestIPv6Legacy(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	t.Setenv("NETKER_DATAPATH", "legacy")
 	s, p := testStore(t)
 	// An uplink that learns its address from router advertisements.
@@ -586,7 +593,7 @@ func dialIn6(ns, addr string, local ...netip.Addr) (string, error) {
 // traffic is redirected in BPF and never crosses the host stack; the
 // container-side counters must see it anyway.
 func TestInterfaceStats(t *testing.T) {
-	requireNetAdmin(t)
+	requireLegacy(t)
 	s, p := testStore(t)
 	n, _ := s.Get(DefaultName)
 	a, b := "5a5a5a5a5a5a5a5a", "5b5b5b5b5b5b5b5b"

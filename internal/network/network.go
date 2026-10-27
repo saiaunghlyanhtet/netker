@@ -57,6 +57,7 @@ type Store struct {
 	paths          config.Paths
 	dp             *datapath.Datapath
 	warnedFallback bool
+	warnedNoNft    bool
 }
 
 func NewStore(p config.Paths) *Store {

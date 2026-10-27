@@ -3,8 +3,10 @@ package network
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -145,6 +147,81 @@ func ensureFamilyRules(n *Network, family, base string, subnet netip.Prefix) err
 }
 
 func removeNetworkRules(name string) error { return deleteRulesWithComment(netComment(name)) }
+
+// nftProbe has one rule of every kind netker installs, per family: a nat
+// chain with masquerade, and a forward chain matching conntrack state.
+// Minimal kernels can have CONFIG_NF_TABLES without the ip or ip6 family,
+// NFT_MASQ or NFT_CT (little-vm-helper's CI kernels, for one).
+var nftProbe = map[string]string{
+	"ip": `add table ip netker_probe
+add chain ip netker_probe p { type nat hook postrouting priority srcnat; policy accept; }
+add rule ip netker_probe p ip saddr 192.0.2.0/24 masquerade
+add chain ip netker_probe f { type filter hook forward priority filter; policy accept; }
+add rule ip netker_probe f ct status dnat accept
+`,
+	"ip6": `add table ip6 netker_probe
+add chain ip6 netker_probe p { type nat hook postrouting priority srcnat; policy accept; }
+add rule ip6 netker_probe p ip6 saddr 2001:db8::/64 masquerade
+add chain ip6 netker_probe f { type filter hook forward priority filter; policy accept; }
+add rule ip6 netker_probe f ct status dnat accept
+`,
+}
+
+// ErrNftNotChecked means nftables support couldn't be checked: not root,
+// and no unprivileged user namespaces either.
+var ErrNftNotChecked = errors.New("not checked: needs root or unprivileged user namespaces")
+
+// NftablesUsable reports whether netker's nftables rules for family ("ip"
+// or "ip6") can be installed: nft is on PATH and the kernel accepts them.
+// It's a dry run (nft -c), checked by the kernel but never applied.
+func NftablesUsable(family string) error {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return fmt.Errorf("nft not installed")
+	}
+	cmd := exec.Command("nft", "-c", "-f", "-")
+	if os.Geteuid() != 0 {
+		// "netker system check" without root: the families the kernel
+		// supports are the same in a user and network namespace of our own.
+		userns := []string{"unshare", "--user", "--map-root-user", "--net"}
+		if exec.Command(userns[0], append(userns[1:], "true")...).Run() != nil {
+			return ErrNftNotChecked
+		}
+		cmd = exec.Command(userns[0], append(userns[1:], "nft", "-c", "-f", "-")...)
+	}
+	cmd.Stdin = strings.NewReader(nftProbe[family])
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if i := strings.IndexByte(msg, '\n'); i > 0 {
+			msg = msg[:i]
+		}
+		return fmt.Errorf("the kernel rejects netker's %s rules: %s", family, msg)
+	}
+	return nil
+}
+
+// ensureRules installs n's nftables rules for an endpoint on the given
+// datapath. The legacy datapath needs them. The eBPF datapath isolates and
+// masquerades in BPF, and its rules only masquerade what BPF hands to the
+// host stack (fragments, other protocols, IPv6 extension headers): without
+// nftables it warns once and carries on.
+func (s *Store) ensureRules(n *Network, mode string) error {
+	if mode == DatapathEBPF {
+		families := []string{"ip"}
+		if n.HasIPv6() {
+			families = append(families, "ip6")
+		}
+		for _, f := range families {
+			if err := NftablesUsable(f); err != nil {
+				if !s.warnedNoNft {
+					fmt.Fprintf(os.Stderr, "warning: nftables unusable (%v): traffic the eBPF datapath hands to the host stack, such as fragments, isn't masqueraded\n", err)
+					s.warnedNoNft = true
+				}
+				return nil
+			}
+		}
+	}
+	return ensureNetworkRules(n)
+}
 
 // PortMapping publishes a container port on the host (docker -p).
 type PortMapping struct {
