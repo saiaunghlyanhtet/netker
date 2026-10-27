@@ -152,6 +152,27 @@ func TestEBPFContainerToContainerRedirect(t *testing.T) {
 	}
 }
 
+// nftables only backs up the eBPF datapath (masquerading what BPF hands to
+// the host stack), so containers must work without it, e.g. on kernels
+// without the nft ip family.
+func TestEBPFWithoutNftables(t *testing.T) {
+	s, _ := ebpfStore(t)
+	t.Setenv("PATH", t.TempDir()) // no nft
+	if err := NftablesUsable("ip"); err == nil {
+		t.Fatal("nft still found")
+	}
+	n, _ := s.Get(DefaultName)
+	_, nsA := attachT(t, s, n, "a5a5a5a5a5a5a5a5")
+	epB, nsB := attachT(t, s, n, "b5b5b5b5b5b5b5b5")
+	if !s.warnedNoNft {
+		t.Fatal("no warning about nftables")
+	}
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	if got, err := dialIn(nsA, epB.IP.String()+":9000"); err != nil || got != "hello from netker" {
+		t.Fatalf("A->B without nftables: %q, %v", got, err)
+	}
+}
+
 func TestEBPFNetworksAreIsolated(t *testing.T) {
 	s, _ := ebpfStore(t)
 	n1, _ := s.Get(DefaultName)

@@ -16,6 +16,7 @@ import (
 	"github.com/saiaunghlyanhtet/netker/internal/config"
 	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
+	"github.com/saiaunghlyanhtet/netker/internal/network"
 )
 
 func systemCmd() *cobra.Command {
@@ -65,7 +66,8 @@ func checkCmd() *cobra.Command {
 			bpffs := unix.Statfs("/sys/fs/bpf", &sfs) == nil && sfs.Type == unix.BPF_FS_MAGIC
 			checks = append(checks, check{name: "bpffs at /sys/fs/bpf", ok: bpffs, warn: !bpffs, detail: "needed by the eBPF datapath"})
 			dp := manager().Networks.Datapath()
-			if err := dp.Load(); errors.Is(err, datapath.ErrIncompatibleMaps) {
+			loadErr := dp.Load()
+			if err := loadErr; errors.Is(err, datapath.ErrIncompatibleMaps) {
 				checks = append(checks, check{name: "eBPF datapath", detail: err.Error()})
 			} else if err != nil {
 				checks = append(checks, check{name: "eBPF datapath", warn: true, detail: "not loadable, containers use the legacy datapath: " + err.Error()})
@@ -83,7 +85,22 @@ func checkCmd() *cobra.Command {
 						lo, hi, datapath.NATPortMin, datapath.NATPortMax)})
 			}
 
-			for _, bin := range []string{config.Runtime(), "nft"} {
+			// The legacy datapath needs nftables; the eBPF one only
+			// masquerades with it what BPF hands to the host stack.
+			if err := network.NftablesUsable("ip"); errors.Is(err, network.ErrNftNotChecked) {
+				checks = append(checks, check{name: "nftables", warn: true, detail: err.Error()})
+			} else if err != nil {
+				detail := "the eBPF datapath works without it, but doesn't masquerade what it hands to the host stack (e.g. fragments): " + err.Error()
+				ebpf := loadErr == nil && config.DatapathMode() != network.DatapathLegacy
+				if !ebpf {
+					detail = "needed by the legacy datapath: " + err.Error()
+				}
+				checks = append(checks, check{name: "nftables", warn: ebpf, detail: detail})
+			} else {
+				checks = append(checks, check{name: "nftables", ok: true})
+			}
+
+			for _, bin := range []string{config.Runtime()} {
 				p, err := exec.LookPath(bin)
 				c := check{name: bin, ok: err == nil, detail: p}
 				if err != nil {
@@ -109,7 +126,7 @@ func checkCmd() *cobra.Command {
 					failed = true
 				}
 				detail := c.detail
-				if c.ok && c.name != "kernel" && c.name != config.Runtime() && c.name != "nft" {
+				if c.ok && c.name != "kernel" && c.name != config.Runtime() {
 					detail = ""
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "[%s] %-26s %s\n", mark, c.name, detail)
