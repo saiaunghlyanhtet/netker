@@ -1,0 +1,113 @@
+name: bpf
+
+# netker's privileged tests on other kernels than the runner's, in
+# little-vm-helper (LVH) VMs, as Cilium tests its datapath across kernels
+# (tests-datapath-verifier, conformance-runtime). In each VM the BPF
+# programs go through that kernel's verifier and the eBPF network tests
+# and end-to-end test run against it (hack/vm-test.sh).
+#
+# LVH kernels are minimal: they have no nftables ip/ip6 families, so the
+# legacy datapath's tests skip there; integration.yml covers them on the
+# runner's kernel.
+on:
+  pull_request:
+    paths:
+      - 'bpf/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'examples/**'
+      - 'hack/e2e.sh'
+      - 'hack/vm-test.sh'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - '.github/workflows/bpf.yml'
+  push:
+    branches: [main]
+  # bpf-next changes daily.
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kernel:
+    name: Kernel ${{ matrix.kernel }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # bpf-next is an early warning, not a gate.
+    continue-on-error: ${{ matrix.kernel == 'bpf-next' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No netkit (it's 6.7+): system check must refuse the kernel.
+          - kernel: '6.6'
+            # renovate: datasource=docker depName=quay.io/lvh-images/kind
+            image: '6.6-20260921.012558'
+            mode: no-netkit
+          # The oldest LTS with netkit.
+          - kernel: '6.12'
+            # renovate: datasource=docker depName=quay.io/lvh-images/kind
+            image: '6.12-20260921.012558'
+          - kernel: '6.18'
+            # renovate: datasource=docker depName=quay.io/lvh-images/kind
+            image: '6.18-20260921.012558'
+          - kernel: 'bpf-next'
+            # renovate: datasource=docker depName=quay.io/lvh-images/kind
+            image: 'bpf-next-20260921.012558'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Static binaries, so the VM needs no Go toolchain.
+      - name: Build netker and the network tests
+        run: |
+          make build
+          CGO_ENABLED=0 go test -c -o bin/network.test ./internal/network/
+
+      - name: Boot the VM
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          test-name: netker-${{ matrix.kernel }}
+          image: kind
+          image-version: ${{ matrix.image }}
+          host-mount: ./
+          images-folder-parent: /var/tmp
+          cpu: 4
+          mem: 8G
+          # renovate: datasource=github-tags depName=cilium/little-vm-helper
+          lvh-version: v0.0.31
+          install-dependencies: 'true'
+          cmd: uname -a
+
+      - name: Run the tests in the VM
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          provision: 'false'
+          cmd: /host/hack/vm-test.sh ${{ matrix.mode }}
+
+      - name: Copy the VM console log
+        if: always()
+        run: sudo cp /tmp/console.log vm-logs/console.log 2>/dev/null && sudo chmod a+r vm-logs/console.log || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: vm-logs-${{ matrix.kernel }}
+          path: vm-logs/
+          retention-days: 7
