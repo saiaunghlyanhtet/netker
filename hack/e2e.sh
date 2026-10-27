@@ -21,6 +21,8 @@ cleanup
 # down, and a host's connections to its own addresses go over lo.
 ip link set lo up
 
+# The single-quoted scripts here and below expand inside the container.
+# shellcheck disable=SC2016
 netker run -d --name e2e-web -p 8080:80 alpine sh -c \
 	'echo serving; while true; do printf "HTTP/1.0 200 OK\r\n\r\nhello from $(hostname)\n" | nc -l -p 80; done' >/dev/null
 sleep 0.5
@@ -71,6 +73,10 @@ echo "ok: names: a removed peer disappears from /etc/hosts"
 
 datapath=$(netker inspect e2e-web | sed -n 's/.*"datapath": "\(.*\)".*/\1/p' | head -1)
 echo "datapath: $datapath"
+# CI sets this so a datapath that silently fell back fails the run.
+if [[ -n "${E2E_EXPECT_DATAPATH:-}" ]]; then
+	expect "containers use the $E2E_EXPECT_DATAPATH datapath" "$E2E_EXPECT_DATAPATH" "$datapath"
+fi
 if [[ "$datapath" == ebpf ]]; then
 	expect "eBPF: container egress is fail-closed" '"peer_policy":"drop"' "$devices"
 	status=$(netker system datapath status)
@@ -106,6 +112,7 @@ if [[ "$datapath" == ebpf ]]; then
 fi
 
 expect "logs" "serving" "$(netker logs e2e-web)"
+# shellcheck disable=SC2016
 expect "exec" "e2e" "$(netker exec -e X=e2e e2e-web sh -c 'echo $X')"
 
 netker stop -t 1 e2e-web >/dev/null

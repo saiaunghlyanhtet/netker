@@ -1,0 +1,99 @@
+name: integration
+
+# As root on the runner's kernel: netker's network tests (real netkit
+# devices and the eBPF datapath) and the CLI end-to-end test, on each
+# datapath. Ubuntu restricts unprivileged user namespaces, so everything
+# runs as root, in its own network namespace (away from Docker's iptables
+# rules on the runner).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# bash -eo pipefail, so "| tee" doesn't hide a failing test.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  network-tests:
+    name: Network tests (eBPF)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      # As real root the eBPF tests don't skip: a program the verifier
+      # rejects fails them.
+      - name: internal/network tests
+        run: |
+          go test -c -o /tmp/network.test ./internal/network/
+          sudo unshare --net --mount /tmp/network.test -test.count=1 -test.v -test.timeout 10m 2>&1 | tee network-tests.log
+      - name: Collect diagnostics
+        if: failure()
+        run: sudo dmesg | tee dmesg.log >/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: network-tests
+          path: |
+            network-tests.log
+            dmesg.log
+
+  e2e:
+    name: End-to-end (${{ matrix.datapath }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        datapath: [ebpf, legacy]
+    env:
+      NETKER_ROOT: /tmp/netker/root
+      NETKER_RUN: /tmp/netker/run
+      # Forced, so a datapath that fails to load fails the run instead of
+      # falling back; e2e.sh checks the containers' datapath too.
+      NETKER_DATAPATH: ${{ matrix.datapath }}
+      E2E_EXPECT_DATAPATH: ${{ matrix.datapath }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install crun and nftables
+        run: sudo apt-get update && sudo apt-get install -y crun nftables
+      - run: make build
+      - name: netker system check
+        run: sudo -E bin/netker system check
+      - name: hack/e2e.sh
+        run: |
+          sudo -E bin/netker pull alpine
+          sudo -E PATH="$PWD/bin:$PATH" unshare --net --mount hack/e2e.sh 2>&1 | tee e2e.log
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          sudo -E bin/netker system datapath status 2>&1 | tee datapath-status.log >/dev/null || true
+          sudo dmesg | tee dmesg.log >/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-${{ matrix.datapath }}
+          path: |
+            e2e.log
+            datapath-status.log
+            dmesg.log
