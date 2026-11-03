@@ -9,19 +9,15 @@ name: bpf
 # LVH kernels are minimal: they have no nftables ip/ip6 families, so the
 # legacy datapath's tests skip there; integration.yml covers them on the
 # runner's kernel.
+#
+# The kernel checks are required on main, so the workflow runs on every
+# PR: with a paths filter, PRs that don't match would wait forever for
+# them. The changes job decides instead; when nothing relevant changed,
+# each kernel job skips its steps and passes under its own name. (A
+# skipped matrix job would be reported under its unexpanded name and
+# leave the required checks waiting too.)
 on:
   pull_request:
-    paths:
-      - 'bpf/**'
-      - 'cmd/**'
-      - 'internal/**'
-      - 'examples/**'
-      - 'hack/e2e.sh'
-      - 'hack/vm-test.sh'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Makefile'
-      - '.github/workflows/bpf.yml'
   push:
     branches: [main]
   # The kernel images are pinned, so a schedule would only rerun what
@@ -40,8 +36,42 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      kernels: ${{ steps.diff.outputs.kernels }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Do the kernel tests need to run?
+        id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Pushes to main and manual runs always test every kernel.
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            echo "kernels=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          echo "$changed"
+          paths='^(bpf/|cmd/|internal/|examples/|hack/e2e\.sh$|hack/vm-test\.sh$|go\.mod$|go\.sum$|Makefile$|\.github/workflows/bpf\.yml$)'
+          if grep -qE "$paths" <<<"$changed"; then
+            echo "kernels=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "kernels=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no datapath changes, the kernel tests are skipped"
+          fi
+
   kernel:
     name: Kernel ${{ matrix.kernel }}
+    needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # bpf-next is an early warning, not a gate.
@@ -67,19 +97,23 @@ jobs:
             image: 'bpf-next-20260921.012558'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.kernels == 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: needs.changes.outputs.kernels == 'true'
         with:
           go-version-file: go.mod
 
       # Static binaries, so the VM needs no Go toolchain.
       - name: Build netker and the network tests
+        if: needs.changes.outputs.kernels == 'true'
         run: |
           make build
           CGO_ENABLED=0 go test -c -o bin/network.test ./internal/network/
 
       - name: Boot the VM
+        if: needs.changes.outputs.kernels == 'true'
         uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           test-name: netker-${{ matrix.kernel }}
@@ -95,17 +129,18 @@ jobs:
           cmd: uname -a
 
       - name: Run the tests in the VM
+        if: needs.changes.outputs.kernels == 'true'
         uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: /host/hack/vm-test.sh ${{ matrix.mode }}
 
       - name: Copy the VM console log
-        if: always()
+        if: ${{ !cancelled() && needs.changes.outputs.kernels == 'true' }}
         run: sudo cp /tmp/console.log vm-logs/console.log 2>/dev/null && sudo chmod a+r vm-logs/console.log || true
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
+        if: ${{ !cancelled() && needs.changes.outputs.kernels == 'true' }}
         with:
           name: vm-logs-${{ matrix.kernel }}
           path: vm-logs/
