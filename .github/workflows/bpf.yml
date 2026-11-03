@@ -24,9 +24,8 @@ on:
       - '.github/workflows/bpf.yml'
   push:
     branches: [main]
-  # bpf-next changes daily.
-  schedule:
-    - cron: '17 3 * * *'
+  # The kernel images are pinned, so a schedule would only rerun what
+  # already passed. New kernels are tested when a PR bumps an image tag.
   workflow_dispatch:
 
 permissions:
