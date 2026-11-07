@@ -141,7 +141,10 @@ func (m *Manager) RemoveHook(c *Container, name string) error {
 	r := c.Hooks[i]
 	var errs []error
 	for _, ep := range c.Endpoints {
-		if err := m.Networks.DetachHook(c.ID, ep, r.Direction, r.Name); err != nil {
+		// Recorded but not attached ("missing" in net hook ls): there's
+		// nothing to detach, only the record to forget.
+		err := m.Networks.DetachHook(c.ID, ep, r.Direction, r.Name)
+		if err != nil && !errors.Is(err, datapath.ErrHookNotAttached) {
 			errs = append(errs, err)
 		}
 	}

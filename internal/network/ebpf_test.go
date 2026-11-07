@@ -1415,6 +1415,9 @@ func TestEBPFHooks(t *testing.T) {
 		if err := toB(); err != nil {
 			t.Fatalf("after removing the hook: %v", err)
 		}
+		if err := s.DetachHook(a, epA, datapath.HookEgress, "deny"); !errors.Is(err, datapath.ErrHookNotAttached) {
+			t.Fatalf("detaching a detached hook: %v, want ErrHookNotAttached", err)
+		}
 	})
 	t.Run("before netker, counting and continuing", func(t *testing.T) {
 		h := datapath.Hook{Name: "count", Direction: datapath.HookEgress, Spec: hookSpec(verdictNext, true), Program: "hook"}
