@@ -150,12 +150,17 @@ func (d *Datapath) AttachHook(containerID, hostIf string, hostIfIndex int, h Hoo
 	return l.Pin(pin)
 }
 
-// DetachHook removes one hook from hostIf. A missing hook is an error.
+// ErrHookNotAttached means a hook has no pinned link on a device, e.g.
+// after bpffs was cleared: "netker net hook ls" shows it as missing.
+var ErrHookNotAttached = errors.New("hook not attached")
+
+// DetachHook removes one hook from hostIf. A hook that isn't attached is
+// an error wrapping ErrHookNotAttached.
 func (d *Datapath) DetachHook(containerID, hostIf, direction, name string) error {
 	pin := d.hookPin(containerID, hostIf, direction, name)
 	l, err := link.LoadPinnedLink(pin, nil)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("no hook %s on %s", name, hostIf)
+		return fmt.Errorf("hook %s on %s: %w", name, hostIf, ErrHookNotAttached)
 	}
 	if err != nil {
 		// Defunct (device gone): just drop the pin.

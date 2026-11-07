@@ -196,6 +196,12 @@ if [[ "$datapath" == ebpf ]]; then
 	netker network create --subnet 10.80.0.0/24 e2e-hooknet >/dev/null
 	netker network connect e2e-hooknet e2e-hookweb
 	expect "hooks: connect attaches the hooks to the new interface" "eth1" "$(netker net hook ls e2e-hookweb | grep attached)"
+	# A hook whose pin is gone (e.g. bpffs was cleared) shows as missing,
+	# and rm must still remove it.
+	hw_id=$(netker inspect e2e-hookweb | sed -n 's/.*"id": "\(.*\)".*/\1/p' | head -1)
+	hw_if1=$(netker inspect e2e-hookweb | sed -n 's/.*"host_if": "\(.*\)".*/\1/p' | sed -n 2p)
+	rm "${NETKER_BPFFS:-/sys/fs/bpf/netker}/hooks/$hw_id/$hw_if1-ingress-block80"
+	expect "hooks: ls shows a hook whose pin is gone as missing" "missing" "$(netker net hook ls e2e-hookweb | grep eth1)"
 	expect "hooks: rm prints the hook name" "block80" "$(netker net hook rm e2e-hookweb block80)"
 	expect "hooks: traffic flows again after rm" "hookweb" "$(curl -s --max-time 3 "http://$hw_ip/")"
 	[[ "$(netker net hook ls e2e-hookweb | wc -l)" == 1 ]] || fail "hooks: ls still lists hooks after rm"
