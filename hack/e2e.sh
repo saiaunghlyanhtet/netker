@@ -196,11 +196,22 @@ if [[ "$datapath" == ebpf ]]; then
 	netker network create --subnet 10.80.0.0/24 e2e-hooknet >/dev/null
 	netker network connect e2e-hooknet e2e-hookweb
 	expect "hooks: connect attaches the hooks to the new interface" "eth1" "$(netker net hook ls e2e-hookweb | grep attached)"
-	# A hook whose pin is gone (e.g. bpffs was cleared) shows as missing,
-	# and rm must still remove it.
+	bpffs=${NETKER_BPFFS:-/sys/fs/bpf/netker}
 	hw_id=$(netker inspect e2e-hookweb | sed -n 's/.*"id": "\(.*\)".*/\1/p' | head -1)
+	hw_if0=$(netker inspect e2e-hookweb | sed -n 's/.*"host_if": "\(.*\)".*/\1/p' | sed -n 1p)
 	hw_if1=$(netker inspect e2e-hookweb | sed -n 's/.*"host_if": "\(.*\)".*/\1/p' | sed -n 2p)
-	rm "${NETKER_BPFFS:-/sys/fs/bpf/netker}/hooks/$hw_id/$hw_if1-ingress-block80"
+	# Pins lost (e.g. bpffs cleared): eth1's hook, and netker's link on
+	# eth0's side where block80 runs. "datapath upgrade" puts back what
+	# the records say: netker's link, then the hooks around it.
+	rm "$bpffs/hooks/$hw_id/$hw_if1-ingress-block80" "$bpffs/links/$hw_id/$hw_if0-primary"
+	up=$(netker system datapath upgrade)
+	expect "upgrade: relinks an interface whose links are missing" "again to eth0" "$up"
+	expect "upgrade: re-attaches the missing and the relinked interface's hooks" "attached 2 hook link(s) again" "$up"
+	[[ "$(netker net hook ls e2e-hookweb | grep -c attached)" == 2 ]] || fail "upgrade: hooks not attached on both interfaces"
+	if curl -s --max-time 2 "http://$hw_ip/" >/dev/null; then fail "upgrade: the re-attached ingress hook doesn't drop"; fi
+	echo "ok: upgrade: the re-attached ingress hook drops TCP to port 80 again"
+	# A hook whose pin is gone shows as missing, and rm must still remove it.
+	rm "$bpffs/hooks/$hw_id/$hw_if1-ingress-block80"
 	expect "hooks: ls shows a hook whose pin is gone as missing" "missing" "$(netker net hook ls e2e-hookweb | grep eth1)"
 	expect "hooks: rm prints the hook name" "block80" "$(netker net hook rm e2e-hookweb block80)"
 	expect "hooks: traffic flows again after rm" "hookweb" "$(curl -s --max-time 3 "http://$hw_ip/")"

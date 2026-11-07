@@ -128,6 +128,12 @@ func datapathUpgradeCmd() *cobra.Command {
 					fmt.Fprintf(out, "restored %d endpoint(s) from the container records; NAT flows through rebuilt maps were reset\n", r.Endpoints)
 				}
 				fmt.Fprintf(out, "updated %d link(s)\n", r.Links)
+				for _, rl := range r.Relinked {
+					fmt.Fprintf(out, "attached netker's programs again to %s of container %s: its links were missing\n", rl.IfName, shortID(rl.ContainerID))
+				}
+				if r.Hooks > 0 {
+					fmt.Fprintf(out, "attached %d hook link(s) again\n", r.Hooks)
+				}
 			}
 			return err
 		},

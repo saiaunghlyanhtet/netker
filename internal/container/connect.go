@@ -141,5 +141,17 @@ func (m *Manager) RebuildDatapath() (*network.RebuildReport, error) {
 			ContainerID: c.ID, NetNSPath: c.NetNSPath, Endpoints: c.Endpoints, Ports: c.Ports,
 		})
 	}
-	return m.Networks.RebuildDatapath(items)
+	report, err := m.Networks.RebuildDatapath(items)
+	if err != nil {
+		return report, err
+	}
+	// Relinked interfaces lost their hooks, to keep them in order around
+	// netker's new links; hooks may also be missing on their own.
+	var errs []error
+	for _, c := range all {
+		n, err := m.reattachHooks(c)
+		report.Hooks += n
+		errs = append(errs, err)
+	}
+	return report, errors.Join(errs...)
 }
