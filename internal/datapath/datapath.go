@@ -109,28 +109,64 @@ func (d *Datapath) Attach(containerID string, ep Endpoint) (err error) {
 	if err := d.RestoreEndpoint(ep); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(d.linksDir(), containerID), 0o700); err != nil {
-		return err
-	}
-	for _, a := range []struct {
-		side string
-		prog *ebpf.Program
-		typ  ebpf.AttachType
-	}{
-		{"peer", d.objs.NkFromContainer, ebpf.AttachNetkitPeer},
-		{"primary", d.objs.NkToContainer, ebpf.AttachNetkitPrimary},
-	} {
-		l, err := link.AttachNetkit(link.NetkitOptions{Interface: ep.HostIfIndex, Program: a.prog, Attach: a.typ})
-		if err != nil {
-			return fmt.Errorf("attach %s program to %s: %w", a.side, ep.HostIf, err)
-		}
-		err = l.Pin(d.linkPin(containerID, ep.HostIf, a.side))
-		l.Close()
-		if err != nil {
-			return fmt.Errorf("pin %s link: %w", a.side, err)
+	for _, side := range []string{"peer", "primary"} {
+		if err := d.attachSide(containerID, ep, side); err != nil {
+			return err
 		}
 	}
 	return d.EnsureHost()
+}
+
+// attachSide attaches netker's program for one side of an endpoint's
+// netkit device ("peer": nk_from_container, "primary": nk_to_container)
+// and pins the link.
+func (d *Datapath) attachSide(containerID string, ep Endpoint, side string) error {
+	prog, typ := d.objs.NkFromContainer, ebpf.AttachNetkitPeer
+	if side == "primary" {
+		prog, typ = d.objs.NkToContainer, ebpf.AttachNetkitPrimary
+	}
+	if err := os.MkdirAll(filepath.Join(d.linksDir(), containerID), 0o700); err != nil {
+		return err
+	}
+	l, err := link.AttachNetkit(link.NetkitOptions{Interface: ep.HostIfIndex, Program: prog, Attach: typ})
+	if err != nil {
+		return fmt.Errorf("attach %s program to %s: %w", side, ep.HostIf, err)
+	}
+	defer l.Close()
+	if err := l.Pin(d.linkPin(containerID, ep.HostIf, side)); err != nil {
+		return fmt.Errorf("pin %s link: %w", side, err)
+	}
+	return nil
+}
+
+// Relink attaches netker's programs again where an endpoint's pinned
+// links are missing, e.g. after bpffs was cleared, and reports whether it
+// did. Without its peer link a container can't send anything (the peer's
+// netkit policy is blackhole). User hooks on the device are detached
+// first: they're anchored before or after netker's links, so the caller
+// attaches them again around the new ones.
+func (d *Datapath) Relink(containerID string, ep Endpoint) (bool, error) {
+	if err := d.Load(); err != nil {
+		return false, err
+	}
+	var missing []string
+	for _, side := range []string{"peer", "primary"} {
+		if _, err := os.Stat(d.linkPin(containerID, ep.HostIf, side)); errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, side)
+		}
+	}
+	if len(missing) == 0 {
+		return false, nil
+	}
+	if err := d.DetachHooks(containerID, ep.HostIf); err != nil {
+		return false, err
+	}
+	for _, side := range missing {
+		if err := d.attachSide(containerID, ep, side); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // RestoreEndpoint writes an endpoint's map entries, IPv4 and, if it has

@@ -104,6 +104,40 @@ func (m *Manager) applyHooks(c *Container, ep *network.Endpoint) error {
 	return errors.Join(errs...)
 }
 
+// reattachHooks attaches c's recorded hooks wherever they aren't attached,
+// from the copies kept with the container: on interfaces "datapath
+// upgrade" relinked, or after bpffs was cleared. Hooks are attached in
+// record order, as they were added.
+func (m *Manager) reattachHooks(c *Container) (int, error) {
+	if len(c.Hooks) == 0 {
+		return 0, nil
+	}
+	states, err := m.Hooks(c)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	var errs []error
+	for _, st := range states {
+		i := slices.IndexFunc(c.Endpoints, func(ep *network.Endpoint) bool { return ep.IfName == st.IfName })
+		if st.State != "missing" || i < 0 || c.Endpoints[i].Datapath != network.DatapathEBPF {
+			continue
+		}
+		spec, prog, err := datapath.LoadHookSpec(m.hookObject(c, st.Name), st.Program)
+		if err == nil {
+			err = m.Networks.AttachHook(c.ID, c.Endpoints[i], datapath.Hook{
+				Name: st.Name, Direction: st.Direction, After: st.After, Spec: spec, Program: prog,
+			})
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("container %s, hook %s on %s: %w", c.Name, st.Name, st.IfName, err))
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {

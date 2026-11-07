@@ -20,6 +20,17 @@ type RebuildReport struct {
 	Rebuilt   []datapath.IncompatibleMap `json:"rebuilt_maps"`
 	Endpoints int                        `json:"endpoints"`
 	Links     int                        `json:"links_updated"`
+	// Relinked lists the interfaces whose missing links were attached
+	// again. Their user hooks were detached; the caller re-attaches them.
+	Relinked []Relinked `json:"relinked,omitempty"`
+	// Hooks counts the user hooks the caller attached again.
+	Hooks int `json:"hooks_reattached,omitempty"`
+}
+
+// Relinked is an interface whose netker links were missing.
+type Relinked struct {
+	ContainerID string `json:"container_id"`
+	IfName      string `json:"ifname"`
 }
 
 // RebuildDatapath brings the eBPF datapath in line with this binary: maps
@@ -33,6 +44,12 @@ func (s *Store) RebuildDatapath(items []RestoreItem) (*RebuildReport, error) {
 		return nil, err
 	}
 	report := &RebuildReport{Rebuilt: rebuilt}
+	type restored struct {
+		containerID string
+		ep          *Endpoint
+		dep         datapath.Endpoint
+	}
+	var eps []restored
 	var errs []error
 	for _, it := range items {
 		for i, ep := range it.Endpoints {
@@ -56,6 +73,7 @@ func (s *Store) RebuildDatapath(items []RestoreItem) (*RebuildReport, error) {
 				continue
 			}
 			report.Endpoints++
+			eps = append(eps, restored{it.ContainerID, ep, dep})
 		}
 	}
 	if err := s.dp.EnsureHost(); err != nil {
@@ -66,7 +84,19 @@ func (s *Store) RebuildDatapath(items []RestoreItem) (*RebuildReport, error) {
 		return report, errors.Join(errs...)
 	}
 	report.Links, err = s.dp.FinishRebuild()
-	return report, err
+	if err != nil {
+		return report, err
+	}
+	// Only now: the new links use this binary's maps, which are pinned.
+	for _, r := range eps {
+		relinked, err := s.dp.Relink(r.containerID, r.dep)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("container %s, %s: %w", r.containerID, r.ep.IfName, err))
+		} else if relinked {
+			report.Relinked = append(report.Relinked, Relinked{r.containerID, r.ep.IfName})
+		}
+	}
+	return report, errors.Join(errs...)
 }
 
 // AttachHook attaches a user BPF program to ep's netkit device, next to

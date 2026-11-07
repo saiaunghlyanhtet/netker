@@ -1375,6 +1375,22 @@ func programOrder(t *testing.T, ep *Endpoint, typ ebpf.AttachType) []ebpf.Progra
 	return ids
 }
 
+// waitPrograms waits until n programs are attached to ep's device for typ.
+func waitPrograms(t *testing.T, ep *Endpoint, typ ebpf.AttachType, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := programOrder(t, ep, typ)
+		if len(got) == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d programs attached (%v), want %d", ep.HostIf, len(got), got, n)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func netkerProgram(t *testing.T, bpffs, containerID string, ep *Endpoint, side string) ebpf.ProgramID {
 	t.Helper()
 	l, err := link.LoadPinnedLink(filepath.Join(bpffs, "links", containerID, ep.HostIf+"-"+side), nil)
@@ -1487,6 +1503,73 @@ func TestEBPFHooks(t *testing.T) {
 			t.Fatalf("hook pins left after detach: %v", err)
 		}
 	})
+}
+
+// An endpoint whose pinned links are gone (e.g. bpffs was cleared) can't
+// send: its peer's policy is blackhole. "datapath upgrade" attaches
+// netker's programs again, and detaches the device's user hooks so the
+// caller can put them back in order around the new links.
+func TestEBPFUpgradeRelinksMissingLinks(t *testing.T) {
+	s, bpffs := ebpfStore(t)
+	n, _ := s.Get(DefaultName)
+	a, b := "a93a93a93a93a93a", "b93b93b93b93b93b"
+	epA, nsA := attachT(t, s, n, a)
+	epB, nsB := attachT(t, s, n, b)
+	listenIn(t, nsB, epB.IP.String()+":9000")
+	listenIn(t, nsA, epA.IP.String()+":9000")
+	toB := func() error { _, err := dialIn(nsA, epB.IP.String()+":9000"); return err }
+	toA := func() error { _, err := dialIn(nsB, epA.IP.String()+":9000"); return err }
+	if err := toB(); err != nil {
+		t.Fatal(err)
+	}
+	h := datapath.Hook{Name: "count", Direction: datapath.HookEgress, Spec: hookSpec(verdictNext, true), Program: "hook"}
+	if err := s.AttachHook(a, epA, h); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct{ id, hostIf string }{{a, epA.HostIf}, {b, epB.HostIf}} {
+		if err := os.Remove(filepath.Join(bpffs, "links", c.id, c.hostIf+"-peer")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// B has no program on its peer side any more: blackhole. (A's hook
+	// alone would let A's traffic through unchecked, as netkit only
+	// applies its policy when no program is attached.)
+	// Unpinning releases a link asynchronously.
+	waitPrograms(t, epA, ebpf.AttachNetkitPeer, 1) // A's hook only
+	waitPrograms(t, epB, ebpf.AttachNetkitPeer, 0)
+	if toA() == nil {
+		t.Fatal("B still sends without nk_from_container")
+	}
+
+	items := []RestoreItem{
+		{ContainerID: a, NetNSPath: nsA, Endpoints: []*Endpoint{epA}},
+		{ContainerID: b, NetNSPath: nsB, Endpoints: []*Endpoint{epB}},
+	}
+	report, err := s.RebuildDatapath(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []Relinked{{a, "eth0"}, {b, "eth0"}}; !slices.Equal(report.Relinked, want) {
+		t.Fatalf("relinked %+v, want %+v", report.Relinked, want)
+	}
+	if err := toA(); err != nil {
+		t.Fatalf("B->A after the upgrade relinked B: %v", err)
+	}
+	if err := toB(); err != nil {
+		t.Fatalf("A->B after the upgrade relinked A: %v", err)
+	}
+	if hls, _ := s.dp.HookLinks(a); len(hls) != 0 {
+		t.Fatalf("hooks left on a relinked device: %+v", hls)
+	}
+	if order := programOrder(t, epA, ebpf.AttachNetkitPeer); len(order) != 1 {
+		t.Fatalf("peer programs %v, want only netker's", order)
+	}
+
+	again, err := s.RebuildDatapath(items)
+	if err != nil || len(again.Relinked) != 0 {
+		t.Fatalf("second upgrade relinked %+v, %v", again.Relinked, err)
+	}
 }
 
 func TestEBPFHooksSurviveUpgrades(t *testing.T) {
