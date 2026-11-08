@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/saiaunghlyanhtet/netker/internal/datapath"
 	"github.com/saiaunghlyanhtet/netker/internal/netkit"
 )
 
@@ -171,15 +172,17 @@ func gcCmd() *cobra.Command {
 				}
 			}
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "removed %d orphaned netkit device(s)\n", devs)
+			fmt.Fprintf(out, "removed %s\n", plural(devs, "orphaned netkit device", "orphaned netkit devices"))
 			dp := m.Networks.Datapath()
 			defer dp.Close()
-			links, entries, err := dp.GC(func(id string) bool { return known[id] })
+			r, err := dp.GC(func(id string) bool { return known[id] })
 			if err != nil {
 				fmt.Fprintf(out, "eBPF datapath not available, skipped: %v\n", err)
 				return nil
 			}
-			fmt.Fprintf(out, "removed %d orphaned BPF link(s) and %d endpoint map entr(y/ies)\n", links, entries)
+			for _, line := range gcLines(r) {
+				fmt.Fprintln(out, line)
+			}
 			return nil
 		},
 	}
@@ -209,4 +212,23 @@ func datapathResetCmd() *cobra.Command {
 			return dp.ResetHost()
 		},
 	}
+}
+
+// gcLines describes what "system gc" removed from the eBPF datapath.
+func gcLines(r datapath.GCReport) []string {
+	return []string{
+		"removed " + plural(r.Links, "orphaned container link", "orphaned container links") +
+			" and " + plural(r.Hooks, "hook link", "hook links"),
+		"removed " + plural(r.HostLinks, "uplink hook", "uplink hooks") + " of devices that are gone",
+		"removed " + plural(r.Endpoints, "stale endpoint entry", "stale endpoint entries") +
+			" and " + plural(r.Ports, "published-port entry", "published-port entries"),
+	}
+}
+
+// plural formats a count with the singular or plural noun.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }

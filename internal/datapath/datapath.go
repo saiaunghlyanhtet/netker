@@ -242,13 +242,22 @@ func (d *Datapath) Detach(containerID, hostIf string, ip, ip6 netip.Addr) error 
 	return errors.Join(errs...)
 }
 
+// GCReport counts what GC removed, by kind.
+type GCReport struct {
+	Links     int `json:"links"`      // netker's links on containers' devices
+	Hooks     int `json:"hooks"`      // user hook links
+	HostLinks int `json:"host_links"` // hooks on uplinks that disappeared
+	Endpoints int `json:"endpoints"`  // endpoint map entries, IPv4 and IPv6
+	Ports     int `json:"ports"`      // published-port map entries
+}
+
 // GC removes pinned links of containers that keep reports as gone, and
 // endpoint entries whose primary device no longer exists.
-func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, err error) {
+func (d *Datapath) GC(keep func(containerID string) bool) (r GCReport, err error) {
 	if err := d.Load(); err != nil {
-		return 0, 0, err
+		return r, err
 	}
-	links += d.gcHooks(keep)
+	r.Hooks = d.gcHooks(keep)
 	cids, _ := os.ReadDir(d.linksDir())
 	for _, c := range cids {
 		if keep(c.Name()) {
@@ -264,7 +273,7 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 			} else {
 				os.Remove(path)
 			}
-			links++
+			r.Links++
 		}
 		os.Remove(dir)
 	}
@@ -279,11 +288,11 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	}
 	for _, k := range stale {
 		if d.objs.NetkerEndpoints.Delete(k) == nil {
-			entries++
+			r.Endpoints++
 		}
 	}
 	if err := it.Err(); err != nil {
-		return links, entries, err
+		return r, err
 	}
 	var key6 netkerIp6Key
 	var stale6 []netkerIp6Key
@@ -295,11 +304,11 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	}
 	for _, k := range stale6 {
 		if d.objs.NetkerEndpoints6.Delete(k) == nil {
-			entries++
+			r.Endpoints++
 		}
 	}
 	if err := it6.Err(); err != nil {
-		return links, entries, err
+		return r, err
 	}
 	// Published ports whose container is gone.
 	var pk netkerPortKey
@@ -315,7 +324,7 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	}
 	for _, k := range stalePorts {
 		if d.objs.NetkerPorts.Delete(k) == nil {
-			entries++
+			r.Ports++
 		}
 	}
 	var pk6 netkerPort6Key
@@ -330,7 +339,7 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	}
 	for _, k := range stalePorts6 {
 		if d.objs.NetkerPorts6.Delete(k) == nil {
-			entries++
+			r.Ports++
 		}
 	}
 	// Uplink links of interfaces that disappeared.
@@ -338,10 +347,10 @@ func (d *Datapath) GC(keep func(containerID string) bool) (links, entries int, e
 	for _, hl := range hls {
 		if hl.Defunct {
 			os.Remove(hl.Pin)
-			links++
+			r.HostLinks++
 		}
 	}
-	return links, entries, pit.Err()
+	return r, errors.Join(pit.Err(), pit6.Err())
 }
 
 // EndpointEntry is one row of the endpoint map.

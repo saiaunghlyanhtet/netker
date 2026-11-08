@@ -300,4 +300,9 @@ if [[ "$datapath" == ebpf ]]; then
 	[[ "$links" == '"links":null' || "$links" == '"links":[]' || -z "$links" ]] || fail "BPF links left behind: $links"
 	echo "ok: cleanup removed all BPF links"
 fi
+gc=$(netker system gc)
+expect "gc: nothing left to collect after cleanup" "removed 0 orphaned netkit devices" "$gc"
+if [[ "$datapath" == ebpf ]]; then
+	expect "gc: no BPF leftovers either" "removed 0 orphaned container links and 0 hook links" "$gc"
+fi
 echo PASS
