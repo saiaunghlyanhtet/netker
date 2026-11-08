@@ -1623,8 +1623,13 @@ func TestEBPFHooksSurviveUpgrades(t *testing.T) {
 		t.Fatalf("hook links %+v, %v", hls, err)
 	}
 	// gc with A's record gone removes its hooks (and links).
-	if _, _, err := s2.dp.GC(func(id string) bool { return id == b }); err != nil {
+	// A's device still exists, so its endpoint entry stays.
+	r, err := s2.dp.GC(func(id string) bool { return id == b })
+	if err != nil {
 		t.Fatal(err)
+	}
+	if want := (datapath.GCReport{Links: 2, Hooks: 1}); r != want {
+		t.Fatalf("gc report %+v, want %+v", r, want)
 	}
 	if hls, _ := s2.dp.HookLinks(a); len(hls) != 0 {
 		t.Fatalf("hooks left after gc: %+v", hls)
